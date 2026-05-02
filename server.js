@@ -30,8 +30,11 @@ const webhooksRouter = require("./webhooks");
 
 const app = express();
 
-app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:5173", credentials: true }));
+// app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:5173", credentials: true }));
 app.use(morgan("dev"));
+app.use(cors({
+  origin: "*"
+}));
 
 // Webhooks MUST be mounted before the global JSON parser so individual webhook
 // files can pull the raw body for HMAC signature verification (Razorpay/Stripe/
