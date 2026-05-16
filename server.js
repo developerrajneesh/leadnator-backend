@@ -834,3 +834,5 @@ connectDB()
     console.error("Failed to start:", err.message);
     process.exit(1);
   });
+
+  module.exports = app;
