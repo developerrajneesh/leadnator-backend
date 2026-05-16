@@ -5,8 +5,15 @@ const Plan = require("./models/Plan");
 const Subscription = require("./models/Subscription");
 const Invoice = require("./models/Invoice");
 const User = require("./models/User");
+const { ownerOnly } = require("./middleware/auth");
 
 const router = express.Router();
+
+// Billing actions are owner-only — a TeamMember should never be able to
+// charge the account or cancel its subscription.
+router.use("/order",  ownerOnly);
+router.use("/verify", ownerOnly);
+router.use("/cancel", ownerOnly);
 
 const KEY_ID     = process.env.RAZORPAY_KEY_ID || "";
 const KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || "";

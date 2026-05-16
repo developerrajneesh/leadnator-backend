@@ -22,12 +22,14 @@ const router = express.Router();
 const whatsapp = require("./whatsapp");
 const razorpay = require("./razorpay");
 const facebook = require("./facebook");
+const instagram = require("./instagram");
 
 router.use("/whatsapp", whatsapp);
 router.use("/razorpay", razorpay);
 router.use("/facebook", facebook);
+router.use("/instagram", instagram);
 
 // Health probe so uptime monitors can ping /webhooks and get a quick 200.
-router.get("/", (_req, res) => res.json({ ok: true, service: "webhooks", mounted: ["whatsapp", "razorpay", "facebook"] }));
+router.get("/", (_req, res) => res.json({ ok: true, service: "webhooks", mounted: ["whatsapp", "razorpay", "facebook", "instagram"] }));
 
 module.exports = router;

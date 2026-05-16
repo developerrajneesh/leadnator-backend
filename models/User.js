@@ -61,4 +61,11 @@ userSchema.methods.comparePassword = function (plain) {
   return bcrypt.compare(plain, this.password);
 };
 
+userSchema.methods.toSafeJSON = function () {
+  const o = this.toJSON();
+  delete o.password;
+  if (o.meta) delete o.meta.accessToken;
+  return o;
+};
+
 module.exports = mongoose.models.User || mongoose.model("User", userSchema);

@@ -1,4 +1,5 @@
 require("dotenv").config();
+require("./config/tls")();
 const http = require("http");
 const express = require("express");
 const cors = require("cors");
@@ -14,9 +15,11 @@ const Campaign    = require("./models/Campaign");
 const MetaAccount = require("./models/MetaAccount");
 const Ticket      = require("./models/Ticket");
 const Plan        = require("./models/Plan");
+const TeamMember  = require("./models/TeamMember");
 const { router: metaRouter, metaErrorHandler } = require("./meta-routes");
 const aiRouter = require("./ai-routes");
 const waRouter = require("./wa-routes");
+const instagramRouter = require("./instagram-routes");
 const calendarRouter = require("./calendar-routes");
 const publicRouter   = require("./public-routes");
 const pricingRouter  = require("./pricing-routes");
@@ -30,11 +33,8 @@ const webhooksRouter = require("./webhooks");
 
 const app = express();
 
-// app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:5173", credentials: true }));
+app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:5173", credentials: true }));
 app.use(morgan("dev"));
-app.use(cors({
-  origin: "*"
-}));
 
 // Webhooks MUST be mounted before the global JSON parser so individual webhook
 // files can pull the raw body for HMAC signature verification (Razorpay/Stripe/
@@ -47,7 +47,8 @@ app.use("/api/", rateLimit({ windowMs: 15 * 60 * 1000, max: 1000 }));
 const JWT_SECRET = process.env.JWT_SECRET || "dev_secret";
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
 
-const signToken = (u) => jwt.sign({ id: u._id.toString(), role: u.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+const signToken       = (u) => jwt.sign({ id: u._id.toString(), role: u.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+const signMemberToken = (m) => jwt.sign({ id: m._id.toString(), kind: "member" }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 
 async function authRequired(req, res, next) {
   const header = req.headers.authorization || "";
@@ -58,6 +59,25 @@ async function authRequired(req, res, next) {
   if (!token) return res.status(401).json({ error: "Not authenticated" });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
+
+    // Team-member tokens carry `kind: "member"`. We resolve the parent
+    // owner User and put it on `req.user` so all existing handlers
+    // (which scope by `req.user._id`) keep working — the member shares
+    // the owner's tenant. The member doc itself goes on `req.member`.
+    if (payload.kind === "member") {
+      const member = await TeamMember.findById(payload.id);
+      if (!member) return res.status(401).json({ error: "Member not found" });
+      if (member.status === "suspended") return res.status(403).json({ error: "Your team account is suspended." });
+      if (member.status === "pending")   return res.status(403).json({ error: "Your invite is still pending." });
+
+      const owner = await User.findById(member.owner);
+      if (!owner) return res.status(401).json({ error: "Owner account no longer exists" });
+
+      req.user   = owner;
+      req.member = member;
+      return next();
+    }
+
     const user = await User.findById(payload.id);
     if (!user) return res.status(401).json({ error: "User not found" });
     req.user = user;
@@ -70,6 +90,33 @@ async function authRequired(req, res, next) {
 function adminOnly(req, res, next) {
   if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin access required" });
   next();
+}
+
+// Block team members from sensitive owner-only endpoints. Owners (no
+// `req.member`) always pass through. Frontend already hides these from
+// the UI, but we re-check on the server so a member can't reach them by
+// crafting requests directly.
+function ownerOnly(req, res, next) {
+  if (req.member) {
+    return res.status(403).json({
+      error: "Owner-only — your team account doesn't have access to this resource.",
+    });
+  }
+  next();
+}
+
+// Generic per-(module, sub-route) permission gate. Mirrors the frontend
+// permissions map on TeamMember.permissions[moduleKey][subRouteKey].
+// Owners pass straight through; members get 403 when the bit is unset.
+function requirePermission(moduleKey, subRouteKey) {
+  return (req, res, next) => {
+    if (!req.member) return next();
+    const perms = req.member.permissions || {};
+    if (perms?.[moduleKey]?.[subRouteKey]) return next();
+    return res.status(403).json({
+      error: `You don't have permission for ${moduleKey}/${subRouteKey}. Ask your team owner to grant it.`,
+    });
+  };
 }
 
 const ah = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -85,11 +132,41 @@ app.use("/api/public", publicRouter);
 // ---------- AUTH ----------
 app.post("/api/auth/login", ah(async (req, res) => {
   const { email = "", password = "" } = req.body || {};
-  const user = await User.findOne({ email: email.trim().toLowerCase() }).select("+password");
-  if (!user) return res.status(401).json({ error: "Invalid credentials" });
-  const ok = await user.comparePassword(password);
-  if (!ok) return res.status(401).json({ error: "Invalid credentials" });
-  res.json({ token: signToken(user), user: user.toJSON() });
+  const normalizedEmail = String(email).trim().toLowerCase();
+
+  // 1. Primary path — owner / admin User.
+  const user = await User.findOne({ email: normalizedEmail }).select("+password");
+  if (user) {
+    const ok = await user.comparePassword(password);
+    if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+    return res.json({ token: signToken(user), user: user.toJSON() });
+  }
+
+  // 2. Fallback — TeamMember created by an Owner from Settings → Team.
+  //    Issues a JWT with `kind: "member"` so authRequired knows to scope
+  //    data under the parent owner's tenant.
+  const member = await TeamMember.findOne({ email: normalizedEmail }).select("+password");
+  if (member) {
+    if (!member.password) {
+      return res.status(401).json({ error: "No password set for this member yet — ask the team owner to set one." });
+    }
+    if (member.status === "suspended") {
+      return res.status(403).json({ error: "Your team account is suspended. Contact your team owner." });
+    }
+    if (member.status === "pending") {
+      return res.status(403).json({ error: "Your invite is still pending — ask your team owner to activate it." });
+    }
+    const ok = await member.comparePassword(password);
+    if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+
+    const owner = await User.findById(member.owner);
+    if (!owner || owner.status === "deleted") {
+      return res.status(403).json({ error: "Your team owner's account is no longer active." });
+    }
+    return res.json({ token: signMemberToken(member), user: member.toSafeJSON() });
+  }
+
+  return res.status(401).json({ error: "Invalid credentials" });
 }));
 
 app.post("/api/auth/signup", ah(async (req, res) => {
@@ -102,6 +179,8 @@ app.post("/api/auth/signup", ah(async (req, res) => {
 }));
 
 app.get("/api/auth/me", authRequired, (req, res) => {
+  // For team members, return their own identity (not the parent owner's).
+  if (req.member) return res.json({ user: req.member.toSafeJSON() });
   res.json({ user: req.user.toJSON() });
 });
 
@@ -385,6 +464,9 @@ app.use("/api/ai", authRequired, aiRouter);
 
 // ---------- WHATSAPP MARKETING (Meta WhatsApp Cloud API) ----------
 app.use("/api/wa", authRequired, waRouter);
+
+// ---------- INSTAGRAM (DMs, comments, automations via Meta Graph API) ----------
+app.use("/api/instagram", authRequired, instagramRouter);
 
 // ---------- CALENDAR (events, availability, booking types) ----------
 app.use("/api/calendar", authRequired, calendarRouter);

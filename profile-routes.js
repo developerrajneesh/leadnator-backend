@@ -5,8 +5,17 @@ const UserSettings = require("./models/UserSettings");
 const ApiKey = require("./models/ApiKey");
 const TeamMember = require("./models/TeamMember");
 const Team = require("./models/Team");
+const { ownerOnly } = require("./middleware/auth");
 
 const router = express.Router();
+
+// Owner-only sub-trees. These are sensitive surfaces a TeamMember
+// should never reach — billing/team management/API keys. Frontend
+// hides them, but we re-check here so a member can't fish around by
+// hitting the URLs directly.
+router.use("/api-keys", ownerOnly);
+router.use("/teams",    ownerOnly);
+router.use("/team",     ownerOnly);
 
 // ---------- USER PROFILE (info) ----------
 router.put("/info", async (req, res, next) => {

@@ -59,4 +59,31 @@ schema.statics.createWithPassword = async function (doc) {
   return member.save();
 };
 
+schema.methods.comparePassword = function (plain) {
+  if (!this.password) return Promise.resolve(false);
+  return bcrypt.compare(plain, this.password);
+};
+
+// Returns a user-shaped payload the frontend can treat just like a User —
+// the frontend uses `role` to pick admin vs user routes, so we always
+// return `role: "user"` for team members and expose their team-role under
+// `memberRole`. `ownerId` lets the UI know they're acting under a tenant.
+schema.methods.toSafeJSON = function () {
+  return {
+    id:           this._id.toString(),
+    name:         this.name,
+    email:        this.email,
+    phone:        this.phone || "",
+    role:         "user",
+    status:       this.status,
+    isTeamMember: true,
+    memberRole:   this.role,
+    permissions:  this.permissions || {},
+    team:         this.team ? this.team.toString() : null,
+    ownerId:      this.owner ? this.owner.toString() : null,
+    createdAt:    this.createdAt,
+    updatedAt:    this.updatedAt,
+  };
+};
+
 module.exports = mongoose.models.TeamMember || mongoose.model("TeamMember", schema);
