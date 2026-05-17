@@ -11,6 +11,7 @@ const InstagramComment = require("./models/InstagramComment");
 
 const FB_API_VERSION = process.env.META_API_VERSION || "v23.0";
 const FB_GRAPH_BASE = `https://graph.facebook.com/${FB_API_VERSION}`;
+const IG_GRAPH_BASE = `https://graph.instagram.com/${FB_API_VERSION}`;
 
 const router = express.Router();
 
@@ -123,6 +124,7 @@ router.post("/connect", async (req, res, next) => {
         pageAccessToken: page.access_token || token,
         connectedAt: new Date(),
         webhookVerifyToken: verifyToken,
+        authMethod: "facebook_page",
       },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
@@ -406,6 +408,387 @@ router.post("/inbox/seed-demo", requireIg, async (req, res, next) => {
     await InstagramMessage.insertMany(demos.map((d) => ({ ...d, user: req.user._id })));
     res.json({ seeded: true });
   } catch (err) { next(err); }
+});
+
+// ---------- Content (posts / reels) ----------
+const MEDIA_FIELDS = [
+  "id",
+  "caption",
+  "media_type",
+  "media_url",
+  "thumbnail_url",
+  "permalink",
+  "timestamp",
+  "like_count",
+  "comments_count",
+  "children{media_type,media_url,thumbnail_url}",
+].join(",");
+
+const MEDIA_DETAIL_FIELDS = [
+  "id",
+  "caption",
+  "media_type",
+  "media_url",
+  "thumbnail_url",
+  "permalink",
+  "timestamp",
+  "like_count",
+  "comments_count",
+  "children{id,media_type,media_url,thumbnail_url,permalink,timestamp}",
+].join(",");
+
+const COMMENT_FIELD_SETS = [
+  "id,text,timestamp,username,like_count",
+  "id,text,timestamp,like_count,from{id,username}",
+  "id,text,timestamp,like_count,from",
+];
+
+function useIgGraphHost(ig) {
+  return ig.authMethod === "oauth" || !ig.pageId;
+}
+
+function igMediaObjectUrl(ig, mediaId) {
+  return useIgGraphHost(ig)
+    ? `${IG_GRAPH_BASE}/${mediaId}`
+    : `${FB_GRAPH_BASE}/${mediaId}`;
+}
+
+/** Page token for the FB Page linked to this IG account (works for /comments on graph.facebook.com). */
+async function resolveFacebookPageTokenForIg(ig, userId) {
+  if (ig.authMethod === "facebook_page" && ig.pageAccessToken) return ig.pageAccessToken;
+
+  const metaToken = await userMetaToken(userId);
+  if (!metaToken || !ig.igAccountId) return null;
+
+  try {
+    const pages = await fb({
+      method: "get",
+      url: `${FB_GRAPH_BASE}/me/accounts`,
+      params: { fields: "id,access_token,instagram_business_account{id}" },
+      token: metaToken,
+    });
+    const page = (pages?.data || []).find(
+      (p) => p.instagram_business_account?.id === ig.igAccountId
+    );
+    return page?.access_token || null;
+  } catch {
+    return null;
+  }
+}
+
+function pickDisplayUrls(m) {
+  const isVideo = m.media_type === "VIDEO" || m.media_type === "REELS";
+  const children = m.children?.data;
+
+  if (m.media_type === "CAROUSEL_ALBUM" && Array.isArray(children) && children.length > 0) {
+    const first = children[0];
+    const childVideo = first.media_type === "VIDEO" || first.media_type === "REELS";
+    const mediaUrl = childVideo
+      ? (first.thumbnail_url || first.media_url || "")
+      : (first.media_url || first.thumbnail_url || "");
+    return {
+      mediaUrl,
+      thumbnailUrl: first.thumbnail_url || first.media_url || mediaUrl,
+      isVideo: childVideo,
+    };
+  }
+
+  if (isVideo) {
+    const thumb = m.thumbnail_url || m.media_url || "";
+    return { mediaUrl: thumb, thumbnailUrl: thumb, isVideo: true };
+  }
+
+  const mediaUrl = m.media_url || m.thumbnail_url || "";
+  return {
+    mediaUrl,
+    thumbnailUrl: m.thumbnail_url || m.media_url || mediaUrl,
+    isVideo: false,
+  };
+}
+
+async function fetchIgMedia(ig, token, { limit = 25, after = "" } = {}) {
+  const params = { fields: MEDIA_FIELDS, limit: String(Math.min(Math.max(limit, 1), 50)) };
+  if (after) params.after = after;
+
+  const accessToken = ig.pageAccessToken || token;
+
+  if (useIgGraphHost(ig)) {
+    return fb({
+      method: "get",
+      url: `${IG_GRAPH_BASE}/me/media`,
+      params,
+      token: accessToken,
+    });
+  }
+
+  return fb({
+    method: "get",
+    url: `${FB_GRAPH_BASE}/${ig.igAccountId}/media`,
+    params,
+    token: accessToken,
+  });
+}
+
+function mapMediaItem(m) {
+  const { mediaUrl, thumbnailUrl, isVideo } = pickDisplayUrls(m);
+  const children = (m.children?.data || []).map((child) => {
+    const urls = pickDisplayUrls(child);
+    return {
+      id: child.id,
+      mediaType: child.media_type || "IMAGE",
+      ...urls,
+      permalink: child.permalink || "",
+    };
+  });
+  return {
+    id: m.id,
+    caption: m.caption || "",
+    mediaType: m.media_type || "IMAGE",
+    mediaUrl,
+    thumbnailUrl,
+    permalink: m.permalink || "",
+    timestamp: m.timestamp || null,
+    likes: m.like_count ?? null,
+    comments: m.comments_count ?? null,
+    isVideo,
+    hasImage: Boolean(mediaUrl || thumbnailUrl),
+    children,
+  };
+}
+
+function parseInsightsPayload(data) {
+  const metrics = {};
+  for (const item of data?.data || []) {
+    let value = null;
+    if (Array.isArray(item.values) && item.values.length > 0) {
+      value = item.values[item.values.length - 1]?.value;
+    } else if (item.total_value?.value != null) {
+      value = item.total_value.value;
+    }
+    metrics[item.name] = value;
+  }
+  return metrics;
+}
+
+function insightMetricsForType(mediaType) {
+  const isReel = mediaType === "REELS" || mediaType === "VIDEO";
+  if (isReel) {
+    return ["reach", "likes", "comments", "shares", "saved", "plays", "total_interactions"];
+  }
+  return ["reach", "likes", "comments", "shares", "saved", "total_interactions"];
+}
+
+function mapIgComment(c) {
+  const from = c.from;
+  const fromUsername = typeof from === "object" && from
+    ? (from.username || from.name || "")
+    : "";
+  return {
+    id: c.id,
+    text: c.text || "",
+    username: c.username || fromUsername || "",
+    timestamp: c.timestamp || null,
+    likes: c.like_count ?? null,
+  };
+}
+
+async function fetchMediaComments(ig, userId, mediaId, accessToken, embedded = null) {
+  const embeddedItems = embedded?.data || [];
+  if (embeddedItems.length > 0) {
+    return {
+      items: embeddedItems.map(mapIgComment),
+      paging: embedded?.paging || null,
+      error: null,
+      source: "embedded",
+    };
+  }
+
+  const attempts = [];
+
+  // Instagram Login token → graph.instagram.com only (IG media IDs are not valid on graph.facebook.com).
+  if (ig.pageAccessToken) {
+    for (const fields of COMMENT_FIELD_SETS) {
+      attempts.push({
+        url: `${IG_GRAPH_BASE}/${mediaId}/comments`,
+        token: ig.pageAccessToken,
+        fields,
+        label: "instagram",
+      });
+    }
+  }
+
+  // Facebook Page linked to same IG account → graph.facebook.com (full comment text).
+  const pageToken = await resolveFacebookPageTokenForIg(ig, userId);
+  if (pageToken) {
+    for (const fields of COMMENT_FIELD_SETS) {
+      attempts.push({
+        url: `${FB_GRAPH_BASE}/${mediaId}/comments`,
+        token: pageToken,
+        fields,
+        label: "facebook_page",
+      });
+    }
+  }
+
+  // Page-connected auth (no Instagram Login).
+  if (!useIgGraphHost(ig) && accessToken && accessToken !== ig.pageAccessToken) {
+    for (const fields of COMMENT_FIELD_SETS) {
+      attempts.push({
+        url: `${FB_GRAPH_BASE}/${mediaId}/comments`,
+        token: accessToken,
+        fields,
+        label: "facebook",
+      });
+    }
+  }
+
+  const errors = [];
+  for (const { url, token, fields } of attempts) {
+    try {
+      const commentsRes = await fb({
+        method: "get",
+        url,
+        params: { fields, limit: "50" },
+        token,
+      });
+      const items = (commentsRes?.data || []).map(mapIgComment);
+      if (items.length > 0) {
+        return { items, paging: commentsRes?.paging || null, error: null, source: "edge" };
+      }
+    } catch (e) {
+      errors.push(e.message);
+    }
+  }
+
+  const permissionHint = /does not exist|missing permissions|Unsupported get request/i.test(errors.join(" "))
+    ? "Reconnect Instagram with instagram_business_manage_comments, or connect the same account via Facebook (Meta) in Settings."
+    : null;
+
+  return {
+    items: [],
+    paging: null,
+    error: permissionHint || (errors.length ? errors[errors.length - 1] : null),
+    source: null,
+  };
+}
+
+// Single post — caption, carousel, comments, insights (reach, engagement, etc.)
+router.get("/media/:mediaId", requireIg, async (req, res, next) => {
+  try {
+    const { mediaId } = req.params;
+    const token = await userMetaToken(req.user._id);
+    const accessToken = req.ig.pageAccessToken || token;
+    const baseUrl = igMediaObjectUrl(req.ig, mediaId);
+
+    let media = null;
+    let embeddedComments = null;
+    const detailFieldSets = [
+      `${MEDIA_DETAIL_FIELDS},comments.limit(50){id,text,timestamp,username,like_count,from{id,username}}`,
+      MEDIA_DETAIL_FIELDS,
+    ];
+
+    for (const fields of detailFieldSets) {
+      try {
+        media = await fb({
+          method: "get",
+          url: baseUrl,
+          params: { fields },
+          token: accessToken,
+        });
+        embeddedComments = media?.comments;
+        if (embeddedComments?.data?.length) break;
+      } catch (e) {
+        if (!media) throw e;
+      }
+    }
+
+    const post = mapMediaItem(media);
+    const comments = await fetchMediaComments(req.ig, req.user._id, mediaId, accessToken, embeddedComments);
+    comments.totalCount = post.comments ?? comments.items.length;
+
+    let insights = { available: false, metrics: {}, error: null };
+    try {
+      const metrics = insightMetricsForType(post.mediaType);
+      const insightsRes = await fb({
+        method: "get",
+        url: `${baseUrl}/insights`,
+        params: { metric: metrics.join(",") },
+        token: accessToken,
+      });
+      insights.available = true;
+      insights.metrics = parseInsightsPayload(insightsRes);
+    } catch (e) {
+      insights.error = e.message;
+    }
+
+    res.json({
+      post,
+      username: req.ig.username,
+      comments,
+      insights,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Proxy image bytes — Instagram CDN blocks hotlinking from localhost; also refreshes expired URLs.
+router.get("/media/:mediaId/picture", requireIg, async (req, res, next) => {
+  try {
+    const token = await userMetaToken(req.user._id);
+    const accessToken = req.ig.pageAccessToken || token;
+
+    const meta = await fb({
+      method: "get",
+      url: igMediaObjectUrl(req.ig, req.params.mediaId),
+      params: { fields: MEDIA_DETAIL_FIELDS },
+      token: accessToken,
+    });
+
+    const { thumbnailUrl, mediaUrl } = pickDisplayUrls(meta);
+    const imageUrl = thumbnailUrl || mediaUrl;
+    if (!imageUrl) return res.status(404).json({ error: "No image available for this post" });
+
+    const imgRes = await axios.get(imageUrl, {
+      responseType: "stream",
+      validateStatus: () => true,
+      timeout: 20000,
+      headers: { "User-Agent": "Leadnator/1.0", Accept: "image/*,*/*" },
+    });
+
+    if (imgRes.status < 200 || imgRes.status >= 300) {
+      return res.status(502).json({ error: "Could not load image from Instagram" });
+    }
+
+    res.setHeader("Cache-Control", "private, max-age=1800");
+    const ct = imgRes.headers["content-type"];
+    if (ct) res.setHeader("Content-Type", ct);
+    imgRes.data.pipe(res);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/media", requireIg, async (req, res, next) => {
+  try {
+    const limit = Number(req.query.limit) || 25;
+    const after = String(req.query.after || "").trim();
+    const token = await userMetaToken(req.user._id);
+
+    const data = await fetchIgMedia(req.ig, token, { limit, after });
+    const posts = (data?.data || []).map(mapMediaItem);
+
+    res.json({
+      posts,
+      username: req.ig.username,
+      paging: {
+        after: data?.paging?.cursors?.after || null,
+        next: data?.paging?.next || null,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ---------- Comments ----------
