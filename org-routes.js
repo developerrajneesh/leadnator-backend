@@ -1,7 +1,4 @@
 const express = require("express");
-const path = require("path");
-const fs = require("fs");
-const multer = require("multer");
 const jwt = require("jsonwebtoken");
 const Organization = require("./models/Organization");
 const {
@@ -15,24 +12,6 @@ const {
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || "dev_secret";
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
-
-const LOGO_DIR = path.join(__dirname, "uploads", "org-logos");
-fs.mkdirSync(LOGO_DIR, { recursive: true });
-
-const logoUpload = multer({
-  storage: multer.diskStorage({
-    destination: LOGO_DIR,
-    filename: (_req, file, cb) => {
-      const ext = path.extname(file.originalname || "") || ".jpg";
-      cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 9)}${ext}`);
-    },
-  }),
-  limits: { fileSize: 2 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => {
-    if (file.mimetype && file.mimetype.startsWith("image/")) cb(null, true);
-    else cb(new Error("Logo must be an image (PNG, JPG, etc.)"));
-  },
-});
 
 function issueToken(req, orgId) {
   if (req.member) {
@@ -49,11 +28,6 @@ function issueToken(req, orgId) {
   );
 }
 
-function publicLogoUrl(req, filename) {
-  const base = process.env.PUBLIC_API_BASE || `${req.protocol}://${req.get("host")}`;
-  return `${base.replace(/\/$/, "")}/uploads/org-logos/${filename}`;
-}
-
 router.get("/", async (req, res, next) => {
   try {
     const organizations = await ensureDefaultOrganization(req.user._id);
@@ -67,12 +41,7 @@ router.get("/", async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-router.post("/", (req, res, next) => {
-  logoUpload.single("logo")(req, res, (err) => {
-    if (err) return res.status(400).json({ error: err.message || "Invalid logo upload" });
-    next();
-  });
-}, async (req, res, next) => {
+router.post("/", async (req, res, next) => {
   try {
     const name = String(req.body?.name || "").trim();
     const loginEmail = String(req.body?.loginEmail || "").trim();
@@ -83,26 +52,17 @@ router.post("/", (req, res, next) => {
       return res.status(400).json({ error: "Workspace login email and password are required" });
     }
 
-    let logoUrl = "";
-    if (req.file?.filename) {
-      logoUrl = publicLogoUrl(req, req.file.filename);
-    }
-
     const org = await createOrganization(req.user._id, {
       name,
       loginEmail,
       password,
       phone,
-      logoUrl,
     });
 
     res.status(201).json({
       organization: organizationPublic(org),
     });
   } catch (err) {
-    if (req.file?.path) {
-      try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
-    }
     if (!err.status) err.status = 500;
     next(err);
   }
