@@ -1,0 +1,619 @@
+// Email Marketing routes — per-user SMTP via Nodemailer + templates +
+// subscribers + campaigns + bulk send.
+
+const express = require("express");
+const nodemailer = require("nodemailer");
+const EmailConfig     = require("./models/EmailConfig");
+const EmailTemplate   = require("./models/EmailTemplate");
+const EmailSubscriber = require("./models/EmailSubscriber");
+const EmailCampaign   = require("./models/EmailCampaign");
+const EmailLog        = require("./models/EmailLog");
+
+const { tenantId, orgFilter } = require("./middleware/tenant");
+const {
+  SESClient,
+  VerifyDomainIdentityCommand,
+  VerifyDomainDkimCommand,
+  GetIdentityVerificationAttributesCommand,
+  GetIdentityDkimAttributesCommand,
+  SendEmailCommand,
+} = require("@aws-sdk/client-ses");
+
+const router = express.Router();
+
+function cleanDomain(input = "") {
+  const raw = String(input || "").trim().toLowerCase();
+  const stripped = raw
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .split("/")[0]
+    .split("?")[0]
+    .split("#")[0]
+    .trim();
+  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(stripped)) return "";
+  return stripped;
+}
+
+function cleanEmail(input = "") {
+  const email = String(input || "").trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return "";
+  return email;
+}
+
+function emailOnDomain(email, domain) {
+  if (!email || !domain) return false;
+  return email === domain || email.endsWith(`@${domain}`);
+}
+
+function sesClient() {
+  const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1";
+  return new SESClient({
+    region,
+    credentials: process.env.AWS_ACCESS_KEY_ID
+      ? {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        }
+      : undefined,
+  });
+}
+
+async function loadConfig(req) {
+  const tid = tenantId(req);
+  let cfg = await EmailConfig.findOne({ organization: tid }).select("+password");
+  if (!cfg) {
+    cfg = await EmailConfig.findOne({
+      user: req.user._id,
+      $or: [{ organization: null }, { organization: { $exists: false } }],
+    }).select("+password");
+  }
+  return cfg;
+}
+
+function makeTransporter(cfg) {
+  return nodemailer.createTransport({
+    host: cfg.host,
+    port: cfg.port,
+    secure: !!cfg.secure,
+    auth: { user: cfg.username, pass: cfg.password },
+  });
+}
+
+function fromHeader(cfg) {
+  if (cfg.fromName && cfg.fromEmail) return `"${cfg.fromName}" <${cfg.fromEmail}>`;
+  return cfg.fromEmail || cfg.username;
+}
+
+// Render simple {{var}} placeholders. `vars` may be an object or a Map-like.
+function renderTemplate(text = "", vars = {}) {
+  return String(text).replace(/\{\{\s*([\w.]+)\s*\}\}/g, (_, k) => {
+    const v = vars?.[k];
+    return v === undefined || v === null ? "" : String(v);
+  });
+}
+
+// Append the saved signature HTML (with a divider) when enabled and non-empty.
+// `useSignature` lets the caller force-disable for a single send.
+function withSignature(bodyHtml, cfg, useSignature) {
+  const sig = cfg?.signature;
+  if (!sig || !sig.html?.trim() || !sig.enabled || useSignature === false) return bodyHtml;
+  return `${bodyHtml}
+<div style="margin-top:24px;padding-top:14px;border-top:1px solid #e5e7eb;color:#6b7280;font-family:Arial,sans-serif">
+  ${sig.html}
+</div>`;
+}
+
+// ---------- CONFIG ----------
+router.get("/config", async (req, res, next) => {
+  try {
+    let cfg = await loadConfig(req);
+    if (!cfg) {
+      cfg = await EmailConfig.create({
+        user: req.user._id,
+        organization: tenantId(req),
+        host: "smtp.gmail.com", port: 587, secure: false,
+      });
+    }
+    res.json({ config: cfg.toJSON() });
+  } catch (err) { next(err); }
+});
+
+router.put("/config", async (req, res, next) => {
+  try {
+    const { _id, id, user, verified, verifiedAt, lastError, ...patch } = req.body || {};
+    // Only update password if a non-empty one was sent (so blank field doesn't wipe it)
+    if (!patch.password) delete patch.password;
+    const cfg = await EmailConfig.findOneAndUpdate(
+      orgFilter(req),
+      { ...patch, user: req.user._id, organization: tenantId(req), verified: false },
+      { new: true, upsert: true, setDefaultsOnInsert: true, runValidators: true }
+    );
+    res.json({ config: cfg.toJSON() });
+  } catch (err) { next(err); }
+});
+
+// ---------- SES: Attach domain + show DNS records ----------
+router.post("/ses/domain/attach", async (req, res, next) => {
+  try {
+    const domain = cleanDomain(req.body?.domain);
+    if (!domain) return res.status(400).json({ error: "Enter a valid domain (e.g. example.com)" });
+
+    const cfg = await EmailConfig.findOneAndUpdate(
+      orgFilter(req),
+      { $setOnInsert: { user: req.user._id, organization: tenantId(req) } },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    );
+
+    const ses = sesClient();
+
+    // 1) Domain identity TXT token
+    const ident = await ses.send(new VerifyDomainIdentityCommand({ Domain: domain }));
+    const token = ident?.VerificationToken || "";
+    if (!token) return res.status(500).json({ error: "SES did not return a verification token" });
+
+    // 2) DKIM tokens (Easy DKIM)
+    const dkim = await ses.send(new VerifyDomainDkimCommand({ Domain: domain }));
+    const dkimTokens = Array.isArray(dkim?.DkimTokens) ? dkim.DkimTokens : [];
+
+    const records = [
+      {
+        type: "TXT",
+        name: `_amazonses.${domain}`,
+        value: token,
+      },
+      ...dkimTokens.slice(0, 3).map((t) => ({
+        type: "CNAME",
+        name: `${t}._domainkey.${domain}`,
+        value: `${t}.dkim.amazonses.com`,
+      })),
+    ];
+
+    cfg.sesDomain = domain;
+    cfg.sesDnsRecords = records;
+    cfg.sesVerified = false;
+    cfg.sesStatus = "DNS records generated. Add them to your DNS, then click Verify.";
+    cfg.sesLastCheckedAt = null;
+    await cfg.save();
+
+    res.json({ ok: true, domain, records });
+  } catch (err) { next(err); }
+});
+
+router.get("/ses/domain/status", async (req, res, next) => {
+  try {
+    const cfg = await loadConfig(req);
+    const domain = cleanDomain(req.query?.domain || cfg?.sesDomain);
+    if (!domain) return res.status(400).json({ error: "No domain attached yet" });
+
+    const ses = sesClient();
+    const [v, d] = await Promise.all([
+      ses.send(new GetIdentityVerificationAttributesCommand({ Identities: [domain] })),
+      ses.send(new GetIdentityDkimAttributesCommand({ Identities: [domain] })),
+    ]);
+
+    const vAttr = v?.VerificationAttributes?.[domain] || null;
+    const dAttr = d?.DkimAttributes?.[domain] || null;
+    const verificationStatus = vAttr?.VerificationStatus || "Unknown";
+    const dkimStatus = dAttr?.DkimVerificationStatus || "Unknown";
+
+    const verified = verificationStatus === "Success" && dkimStatus === "Success";
+
+    if (cfg) {
+      cfg.sesDomain = domain;
+      cfg.sesVerified = verified;
+      cfg.sesStatus = `Identity: ${verificationStatus} · DKIM: ${dkimStatus}`;
+      cfg.sesLastCheckedAt = new Date();
+      await cfg.save();
+    }
+
+    res.json({
+      ok: true,
+      domain,
+      verified,
+      verificationStatus,
+      dkimStatus,
+      lastCheckedAt: new Date().toISOString(),
+      records: cfg?.sesDnsRecords || [],
+    });
+  } catch (err) { next(err); }
+});
+
+router.put("/ses/from", async (req, res, next) => {
+  try {
+    const cfg = await loadConfig(req);
+    if (!cfg?.sesDomain) {
+      return res.status(400).json({ error: "Attach and verify a domain in SES first." });
+    }
+    const fromEmail = cleanEmail(req.body?.fromEmail);
+    const fromName = String(req.body?.fromName || "").trim();
+    if (!fromEmail) return res.status(400).json({ error: "Enter a valid sender email (e.g. support@yourdomain.com)" });
+    if (!emailOnDomain(fromEmail, cfg.sesDomain)) {
+      return res.status(400).json({
+        error: `Sender must use your verified domain (@${cfg.sesDomain}), e.g. support@${cfg.sesDomain}`,
+      });
+    }
+    cfg.sesFromEmail = fromEmail;
+    cfg.sesFromName = fromName;
+    await cfg.save();
+    res.json({ ok: true, config: cfg.toJSON() });
+  } catch (err) { next(err); }
+});
+
+router.post("/ses/test-send", async (req, res, next) => {
+  try {
+    const to = cleanEmail(req.body?.to);
+    if (!to) return res.status(400).json({ error: "Recipient email required" });
+
+    const cfg = await loadConfig(req);
+    if (!cfg?.sesDomain) {
+      return res.status(400).json({ error: "Attach your domain in the SES section first." });
+    }
+    if (!cfg.sesVerified) {
+      return res.status(400).json({ error: "Domain not verified yet. Add DNS records and click Verify." });
+    }
+
+    const fromEmail = cleanEmail(req.body?.fromEmail || cfg.sesFromEmail);
+    const fromName = String(req.body?.fromName ?? cfg.sesFromName ?? "").trim();
+    if (!fromEmail) {
+      return res.status(400).json({ error: `Set a sender address on @${cfg.sesDomain} (e.g. support@${cfg.sesDomain})` });
+    }
+    if (!emailOnDomain(fromEmail, cfg.sesDomain)) {
+      return res.status(400).json({ error: `Sender must be on @${cfg.sesDomain}` });
+    }
+
+    cfg.sesFromEmail = fromEmail;
+    if (fromName) cfg.sesFromName = fromName;
+    await cfg.save();
+
+    const source = fromName ? `"${fromName.replace(/"/g, "")}" <${fromEmail}>` : fromEmail;
+    const ses = sesClient();
+    const out = await ses.send(new SendEmailCommand({
+      Source: source,
+      Destination: { ToAddresses: [to] },
+      Message: {
+        Subject: { Data: "Test email from Leadnator (Amazon SES)", Charset: "UTF-8" },
+        Body: {
+          Html: {
+            Data: `<p>Hello!</p><p>This is a test email sent via <strong>Amazon SES</strong> from <code>${fromEmail}</code>.</p><p>If you received this, SES sending works ✅.</p>`,
+            Charset: "UTF-8",
+          },
+          Text: {
+            Data: `Test email from ${fromEmail} via Leadnator Amazon SES.`,
+            Charset: "UTF-8",
+          },
+        },
+      },
+    }));
+
+    EmailLog.create({
+      user: req.user._id,
+      to,
+      subject: "Test email from Leadnator (Amazon SES)",
+      html: `SES test from ${fromEmail}`,
+      messageId: out.MessageId || "",
+      status: "sent",
+    }).catch(() => {});
+
+    res.json({ ok: true, messageId: out.MessageId, from: fromEmail });
+  } catch (err) {
+    const msg = err.message || "SES send failed";
+    res.status(400).json({ error: msg });
+  }
+});
+
+router.post("/config/test", async (req, res, next) => {
+  try {
+    const cfg = await loadConfig(req);
+    if (!cfg) return res.status(400).json({ error: "Save SMTP config first." });
+    if (!cfg.password) return res.status(400).json({ error: "Set the SMTP password before testing." });
+
+    const transporter = makeTransporter(cfg);
+    try {
+      await transporter.verify();
+      cfg.verified = true; cfg.verifiedAt = new Date(); cfg.lastError = "";
+      await cfg.save();
+      res.json({ ok: true, message: "SMTP connection verified successfully." });
+    } catch (err) {
+      cfg.verified = false; cfg.lastError = err.message;
+      await cfg.save();
+      res.status(400).json({ ok: false, error: err.message });
+    }
+  } catch (err) { next(err); }
+});
+
+// Save signature (and toggle) — kept inside EmailConfig.signature
+router.put("/signature", async (req, res, next) => {
+  try {
+    const allowed = ["enabled", "html", "name", "title", "company", "email", "phone", "website", "avatarUrl"];
+    const set = {};
+    for (const k of allowed) {
+      if (req.body?.[k] !== undefined) set[`signature.${k}`] = req.body[k];
+    }
+    const cfg = await EmailConfig.findOneAndUpdate(
+      orgFilter(req),
+      { $set: set, user: req.user._id, organization: tenantId(req) },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    );
+    res.json({ signature: cfg.signature });
+  } catch (err) { next(err); }
+});
+
+// Quick one-off send — used by pipeline / kanban "email this lead" modal.
+// Accepts { to, subject, html, useSignature? } and sends via the per-user SMTP config.
+router.post("/quick-send", async (req, res, next) => {
+  try {
+    const { to, subject, html, useSignature } = req.body || {};
+    if (!to) return res.status(400).json({ error: "'to' email required" });
+    if (!subject?.trim()) return res.status(400).json({ error: "Subject required" });
+    if (!html?.trim())    return res.status(400).json({ error: "Message body required" });
+
+    const cfg = await loadConfig(req);
+    if (!cfg)          return res.status(400).json({ error: "No SMTP config — open /email/config first." });
+    if (!cfg.password) return res.status(400).json({ error: "SMTP password not set — open /email/config." });
+
+    const transporter = makeTransporter(cfg);
+    try {
+      const info = await transporter.sendMail({
+        from: fromHeader(cfg),
+        to,
+        replyTo: cfg.replyTo || undefined,
+        subject,
+        html: withSignature(html, cfg, useSignature !== false),
+      });
+      EmailLog.create({ user: req.user._id, to, subject, html, messageId: info.messageId, status: "sent" })
+        .catch((e) => console.warn("[email log] persist failed:", e.message));
+      res.json({ ok: true, messageId: info.messageId });
+    } catch (sendErr) {
+      EmailLog.create({ user: req.user._id, to, subject, html, status: "failed", error: sendErr.message })
+        .catch(() => {});
+      throw sendErr;
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Return last N emails sent to a given address from this user — used by the
+// Quick Contact modal to show prior correspondence.
+router.get("/quick-send/history", async (req, res, next) => {
+  try {
+    const to = String(req.query.to || "").trim().toLowerCase();
+    if (!to) return res.status(400).json({ error: "'to' query param required" });
+    const limit = Math.min(Number(req.query.limit) || 20, 100);
+    const logs = await EmailLog.find({ user: req.user._id, to }).sort({ ts: -1 }).limit(limit);
+    res.json({ history: logs.map((l) => l.toJSON()).reverse() });
+  } catch (err) { next(err); }
+});
+
+router.post("/config/test-send", async (req, res, next) => {
+  try {
+    const { to } = req.body || {};
+    if (!to) return res.status(400).json({ error: "to email required" });
+    const cfg = await loadConfig(req);
+    if (!cfg?.password) return res.status(400).json({ error: "Save SMTP config + password first." });
+
+    const transporter = makeTransporter(cfg);
+    const info = await transporter.sendMail({
+      from: fromHeader(cfg),
+      to,
+      replyTo: cfg.replyTo || undefined,
+      subject: "Test email from Leadnator",
+      html: withSignature(
+        `<p>Hello!</p><p>This is a test email from your Leadnator SMTP config.</p><p>If you got this, your setup works ✅.</p>`,
+        cfg, true
+      ),
+    });
+    res.json({ ok: true, messageId: info.messageId });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- TEMPLATES ----------
+router.get("/templates", async (req, res, next) => {
+  try {
+    const list = await EmailTemplate.find({ user: req.user._id }).sort({ createdAt: -1 });
+    res.json({ templates: list });
+  } catch (err) { next(err); }
+});
+
+router.post("/templates", async (req, res, next) => {
+  try {
+    const { name, subject, body, category = "general" } = req.body || {};
+    if (!name || !subject || !body) return res.status(400).json({ error: "name, subject, body required" });
+    const t = await EmailTemplate.create({ user: req.user._id, name, subject, body, category });
+    res.status(201).json({ template: t });
+  } catch (err) { next(err); }
+});
+
+router.put("/templates/:id", async (req, res, next) => {
+  try {
+    const { _id, id, user, ...patch } = req.body || {};
+    const t = await EmailTemplate.findOneAndUpdate(
+      { _id: req.params.id, user: req.user._id }, patch, { new: true, runValidators: true }
+    );
+    if (!t) return res.status(404).json({ error: "Template not found" });
+    res.json({ template: t });
+  } catch (err) { next(err); }
+});
+
+router.delete("/templates/:id", async (req, res, next) => {
+  try {
+    const r = await EmailTemplate.deleteOne({ _id: req.params.id, user: req.user._id });
+    if (!r.deletedCount) return res.status(404).json({ error: "Template not found" });
+    res.json({ deleted: req.params.id });
+  } catch (err) { next(err); }
+});
+
+// ---------- SUBSCRIBERS ----------
+router.get("/subscribers", async (req, res, next) => {
+  try {
+    const { q = "", status = "all" } = req.query;
+    const filter = { user: req.user._id };
+    if (status !== "all") filter.status = status;
+    if (q.trim()) {
+      const rx = new RegExp(q.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [{ name: rx }, { email: rx }];
+    }
+    const list = await EmailSubscriber.find(filter).sort({ createdAt: -1 });
+    res.json({ subscribers: list });
+  } catch (err) { next(err); }
+});
+
+router.post("/subscribers", async (req, res, next) => {
+  try {
+    const { name = "", email, tags = [] } = req.body || {};
+    if (!email) return res.status(400).json({ error: "email required" });
+    const s = await EmailSubscriber.create({ user: req.user._id, name, email, tags });
+    res.status(201).json({ subscriber: s });
+  } catch (err) {
+    if (err.code === 11000) return res.status(409).json({ error: "That email is already subscribed." });
+    next(err);
+  }
+});
+
+router.put("/subscribers/:id", async (req, res, next) => {
+  try {
+    const { _id, id, user, ...patch } = req.body || {};
+    const s = await EmailSubscriber.findOneAndUpdate(
+      { _id: req.params.id, user: req.user._id }, patch, { new: true, runValidators: true }
+    );
+    if (!s) return res.status(404).json({ error: "Subscriber not found" });
+    res.json({ subscriber: s });
+  } catch (err) { next(err); }
+});
+
+router.delete("/subscribers/:id", async (req, res, next) => {
+  try {
+    const r = await EmailSubscriber.deleteOne({ _id: req.params.id, user: req.user._id });
+    if (!r.deletedCount) return res.status(404).json({ error: "Subscriber not found" });
+    res.json({ deleted: req.params.id });
+  } catch (err) { next(err); }
+});
+
+router.post("/subscribers/bulk", async (req, res, next) => {
+  try {
+    const list = Array.isArray(req.body?.subscribers) ? req.body.subscribers : [];
+    const docs = list
+      .filter((s) => s?.email)
+      .map((s) => ({
+        user: req.user._id,
+        name: String(s.name || "").trim(),
+        email: String(s.email).trim().toLowerCase(),
+        tags: Array.isArray(s.tags) ? s.tags : [],
+        source: s.source || "import",
+      }));
+
+    let inserted = 0, skipped = 0;
+    for (const d of docs) {
+      try { await EmailSubscriber.create(d); inserted += 1; }
+      catch (e) { if (e.code === 11000) skipped += 1; else throw e; }
+    }
+    res.json({ inserted, skipped, total: docs.length });
+  } catch (err) { next(err); }
+});
+
+// ---------- CAMPAIGNS ----------
+router.get("/campaigns", async (req, res, next) => {
+  try {
+    const list = await EmailCampaign.find({ user: req.user._id })
+      .populate("template", "name").sort({ createdAt: -1 });
+    res.json({ campaigns: list });
+  } catch (err) { next(err); }
+});
+
+router.post("/campaigns", async (req, res, next) => {
+  try {
+    const { name, subject, body, templateId, recipientIds = [] } = req.body || {};
+    if (!name || !subject || !body) return res.status(400).json({ error: "name, subject, body required" });
+    const c = await EmailCampaign.create({
+      user: req.user._id, name, subject, body,
+      template: templateId || null,
+      recipients: recipientIds,
+      status: "draft",
+    });
+    res.status(201).json({ campaign: c });
+  } catch (err) { next(err); }
+});
+
+router.delete("/campaigns/:id", async (req, res, next) => {
+  try {
+    const r = await EmailCampaign.deleteOne({ _id: req.params.id, user: req.user._id });
+    if (!r.deletedCount) return res.status(404).json({ error: "Campaign not found" });
+    res.json({ deleted: req.params.id });
+  } catch (err) { next(err); }
+});
+
+// SEND a campaign (or test) immediately.
+router.post("/campaigns/:id/send", async (req, res, next) => {
+  try {
+    const cfg = await loadConfig(req);
+    if (!cfg?.password) {
+      return res.status(400).json({ error: "Set up SMTP config first under Email → Config." });
+    }
+    const camp = await EmailCampaign.findOne({ _id: req.params.id, user: req.user._id })
+      .populate("recipients", "name email status");
+    if (!camp) return res.status(404).json({ error: "Campaign not found" });
+
+    const recipients = (camp.recipients || []).filter((r) => r.status === "active");
+    if (!recipients.length) return res.status(400).json({ error: "No active recipients selected" });
+
+    // Per-call signature override; defaults to whatever the user has saved.
+    // Only honors `useSignature: false` if the saved signature actually has HTML.
+    const signatureSet = !!cfg?.signature?.html?.trim();
+    const useSignature = req.body?.useSignature === false ? false : (signatureSet && cfg.signature.enabled);
+
+    const transporter = makeTransporter(cfg);
+    camp.status = "sending"; await camp.save();
+
+    let sent = 0, failed = 0;
+    for (const r of recipients) {
+      const vars = { name: r.name || r.email.split("@")[0], firstName: (r.name || "").split(" ")[0], email: r.email };
+      try {
+        const info = await transporter.sendMail({
+          from: fromHeader(cfg),
+          to: r.email,
+          replyTo: cfg.replyTo || undefined,
+          subject: renderTemplate(camp.subject, vars),
+          html:    withSignature(renderTemplate(camp.body, vars), cfg, useSignature),
+        });
+        sent += 1;
+        camp.log.push({ email: r.email, status: "sent", messageId: info.messageId });
+      } catch (e) {
+        failed += 1;
+        camp.log.push({ email: r.email, status: "failed", error: e.message });
+      }
+    }
+
+    camp.sent = sent;
+    camp.failed = failed;
+    camp.status = failed === recipients.length ? "failed" : "completed";
+    camp.sentAt = new Date();
+    await camp.save();
+    res.json({ campaign: camp, sent, failed });
+  } catch (err) { next(err); }
+});
+
+// ---------- STATS ----------
+router.get("/stats", async (req, res, next) => {
+  try {
+    const [campaigns, subs, templates, cfg] = await Promise.all([
+      EmailCampaign.find({ user: req.user._id }),
+      EmailSubscriber.countDocuments({ user: req.user._id, status: "active" }),
+      EmailTemplate.countDocuments({ user: req.user._id }),
+      EmailConfig.findOne({ user: req.user._id }),
+    ]);
+    const totalSent   = campaigns.reduce((s, c) => s + (c.sent   || 0), 0);
+    const totalFailed = campaigns.reduce((s, c) => s + (c.failed || 0), 0);
+    res.json({
+      campaigns: campaigns.length,
+      activeSubscribers: subs,
+      templates,
+      totalSent,
+      totalFailed,
+      configured: !!(cfg && cfg.verified),
+    });
+  } catch (err) { next(err); }
+});
+
+module.exports = router;

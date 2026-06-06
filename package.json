@@ -1,0 +1,37 @@
+{
+  "name": "leadnator-backend",
+  "version": "1.0.0",
+  "description": "Leadnator — AI-powered lead management SaaS (backend)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --use-system-ca server.js",
+    "dev": "nodemon --exec \"node --use-system-ca\" server.js",
+    "seed": "node --use-system-ca seed.js",
+    "wa:subscribe-all": "node --use-system-ca scripts/subscribe-all-wabas.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-ses": "^3.1054.0",
+    "aws-sdk": "^2.1693.0",
+    "axios": "^1.15.0",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "csv-parser": "^3.0.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "googleapis": "^173.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.5.0",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "nodemailer": "^6.9.14",
+    "openai": "^4.56.0",
+    "razorpay": "^2.9.6",
+    "socket.io": "^4.8.3",
+    "stripe": "^16.0.0",
+    "vm2": "^3.9.17"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}
