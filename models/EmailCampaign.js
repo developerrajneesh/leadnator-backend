@@ -7,6 +7,7 @@ const schema = new mongoose.Schema(
     subject:     { type: String, required: true },
     body:        { type: String, required: true },
     template:    { type: mongoose.Schema.Types.ObjectId, ref: "EmailTemplate", default: null },
+    senderId:    { type: String, default: "" },   // which EmailConfig.senders profile to send from
     recipients:  [{ type: mongoose.Schema.Types.ObjectId, ref: "EmailSubscriber" }],
     status:      { type: String, enum: ["draft", "scheduled", "sending", "completed", "failed"], default: "draft" },
     sent:        { type: Number, default: 0 },

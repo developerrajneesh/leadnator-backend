@@ -22,8 +22,18 @@ const schema = new mongoose.Schema(
     sesVerified: { type: Boolean, default: false },
     sesStatus: { type: String, default: "" },
     sesLastCheckedAt: { type: Date, default: null },
-    sesFromEmail: { type: String, default: "" },   // e.g. support@example.com
+    sesFromEmail: { type: String, default: "" },   // legacy single sender (kept as fallback)
     sesFromName: { type: String, default: "" },
+
+    // Multiple sender profiles on the verified domain (support@, sales@, …).
+    // One is marked default; campaigns/automations can pick any by _id.
+    senders: [
+      {
+        name:      { type: String, default: "" },
+        email:     { type: String, required: true },
+        isDefault: { type: Boolean, default: false },
+      },
+    ],
 
     // Signature appended to outgoing campaign emails (when enabled).
     signature: {

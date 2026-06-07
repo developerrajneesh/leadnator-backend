@@ -50,7 +50,9 @@ async function sendEmail({ user, lead, config }) {
 
   let subject = config.subject || "Hello {{firstName}}";
   let body    = config.body    || "Hi {{firstName}}, thanks for reaching out.";
-  if (config.templateId) {
+  // Only look up a template when the id is a real ObjectId — flow nodes can
+  // carry stray text here, which would otherwise throw a Cast error.
+  if (config.templateId && /^[a-f0-9]{24}$/i.test(String(config.templateId))) {
     const t = await EmailTemplate.findOne({ _id: config.templateId, user: userId });
     if (t) { subject = t.subject; body = t.body; }
   }
@@ -65,6 +67,7 @@ async function sendEmail({ user, lead, config }) {
     const info = await sendViaSes(cfg, {
       to: lead.email,
       replyTo: cfg.replyTo || undefined,
+      senderId: config.senderId || undefined,
       subject: render(subject, vars),
       html,
     });

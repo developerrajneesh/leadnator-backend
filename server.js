@@ -604,6 +604,7 @@ app.get("/api/lead-flows", authRequired, ah(async (req, res) => {
   res.json({ flows });
 }));
 app.get("/api/lead-flows/:id", authRequired, ah(async (req, res) => {
+  if (!/^[a-f0-9]{24}$/i.test(req.params.id)) return res.status(404).json({ error: "Flow not found" });
   const flow = await LeadFlow.findOne({ _id: req.params.id, ...leadFlowScope(req) });
   if (!flow) return res.status(404).json({ error: "Flow not found" });
   res.json({ flow });

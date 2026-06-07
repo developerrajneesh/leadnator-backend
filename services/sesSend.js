@@ -25,18 +25,30 @@ function sesClient() {
   });
 }
 
-// The From address to send from. Uses the user's saved sender, else falls back
-// to noreply@<their verified domain> so a verified domain alone is enough to
-// send (no separate "save sender" step required).
-function sesFromAddress(cfg) {
-  return cfg.sesFromEmail || (cfg.sesDomain ? `noreply@${cfg.sesDomain}` : "");
+// Resolve which sender profile to send from. `senderId` (an EmailConfig.senders
+// _id) wins if given & found; else the profile marked default; else the first
+// profile; else the legacy single sender; else noreply@<verified domain>.
+function resolveSender(cfg, senderId) {
+  const list = Array.isArray(cfg?.senders) ? cfg.senders : [];
+  let s = null;
+  if (senderId) s = list.find((x) => String(x._id) === String(senderId) || x.email === senderId);
+  if (!s) s = list.find((x) => x.isDefault) || list[0] || null;
+  const email =
+    (s && s.email) || cfg?.sesFromEmail || (cfg?.sesDomain ? `noreply@${cfg.sesDomain}` : "");
+  const name = (s && s.name) || cfg?.sesFromName || "";
+  return { name, email };
 }
 
-// Build the SES "Source" header.
-function sesSource(cfg) {
-  const name = String(cfg.sesFromName || "").replace(/"/g, "");
-  const addr = sesFromAddress(cfg);
-  return name ? `"${name}" <${addr}>` : addr;
+// The From address to send from (default/legacy/fallback resolution).
+function sesFromAddress(cfg, senderId) {
+  return resolveSender(cfg, senderId).email;
+}
+
+// Build the SES "Source" header for the chosen sender.
+function sesSource(cfg, senderId) {
+  const { name, email } = resolveSender(cfg, senderId);
+  const clean = String(name).replace(/"/g, "");
+  return clean ? `"${clean}" <${email}>` : email;
 }
 
 // True when the user has a verified domain — that's all we need, since the
@@ -55,14 +67,15 @@ function assertSesReady(cfg) {
     );
 }
 
-// Send one email via the user's SES identity. Returns { messageId }.
-async function sendViaSes(cfg, { to, subject, html, text, replyTo }) {
+// Send one email via the user's SES identity. `senderId` picks a sender
+// profile (default when omitted). Returns { messageId }.
+async function sendViaSes(cfg, { to, subject, html, text, replyTo, senderId }) {
   assertSesReady(cfg);
   const ses = sesClient();
   const reply = replyTo || cfg.replyTo || "";
   const out = await ses.send(
     new SendEmailCommand({
-      Source: sesSource(cfg),
+      Source: sesSource(cfg, senderId),
       Destination: { ToAddresses: [to] },
       ReplyToAddresses: reply ? [reply] : undefined,
       Message: {
@@ -77,4 +90,4 @@ async function sendViaSes(cfg, { to, subject, html, text, replyTo }) {
   return { messageId: out.MessageId || "" };
 }
 
-module.exports = { sesClient, sesSource, sesFromAddress, sesReady, assertSesReady, sendViaSes };
+module.exports = { sesClient, sesSource, sesFromAddress, resolveSender, sesReady, assertSesReady, sendViaSes };

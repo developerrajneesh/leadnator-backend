@@ -7,6 +7,7 @@ const EmailTemplate   = require("./models/EmailTemplate");
 const EmailSubscriber = require("./models/EmailSubscriber");
 const EmailCampaign   = require("./models/EmailCampaign");
 const EmailLog        = require("./models/EmailLog");
+const EmailMessage    = require("./models/EmailMessage");
 
 const { tenantId, orgFilter } = require("./middleware/tenant");
 const {
@@ -17,7 +18,7 @@ const {
   GetIdentityDkimAttributesCommand,
   SendEmailCommand,
 } = require("@aws-sdk/client-ses");
-const { sendViaSes, sesReady } = require("./services/sesSend");
+const { sendViaSes, sesReady, resolveSender } = require("./services/sesSend");
 
 const router = express.Router();
 
@@ -43,6 +44,23 @@ function cleanEmail(input = "") {
 function emailOnDomain(email, domain) {
   if (!email || !domain) return false;
   return email === domain || email.endsWith(`@${domain}`);
+}
+
+// Migrate the legacy single sender into the senders[] list and guarantee
+// exactly one default. Mutates cfg (caller saves).
+function normalizeSenders(cfg) {
+  if (!Array.isArray(cfg.senders)) cfg.senders = [];
+  // Seed from legacy fields if the list is empty.
+  if (cfg.senders.length === 0 && cfg.sesFromEmail) {
+    cfg.senders.push({ name: cfg.sesFromName || "", email: cfg.sesFromEmail, isDefault: true });
+  }
+  if (cfg.senders.length && !cfg.senders.some((s) => s.isDefault)) {
+    cfg.senders[0].isDefault = true;
+  }
+  // Keep legacy fields mirrored to the default for backward compatibility.
+  const def = cfg.senders.find((s) => s.isDefault);
+  if (def) { cfg.sesFromEmail = def.email; cfg.sesFromName = def.name || ""; }
+  return cfg;
 }
 
 function sesClient() {
@@ -112,6 +130,11 @@ router.get("/config", async (req, res, next) => {
         organization: tenantId(req),
         host: "smtp.gmail.com", port: 587, secure: false,
       });
+    }
+    // Lazily migrate a legacy single sender into senders[] so the UI sees it.
+    if ((cfg.senders || []).length === 0 && cfg.sesFromEmail) {
+      normalizeSenders(cfg);
+      await cfg.save();
     }
     res.json({ config: cfg.toJSON() });
   } catch (err) { next(err); }
@@ -204,7 +227,10 @@ router.get("/ses/domain/status", async (req, res, next) => {
       cfg.sesLastCheckedAt = new Date();
       // Once verified, default a sender on the domain if the user hasn't set one,
       // so sending works immediately (and never falls back to old SMTP).
-      if (verified && !cfg.sesFromEmail) cfg.sesFromEmail = `noreply@${domain}`;
+      if (verified && !cfg.sesFromEmail && (cfg.senders || []).length === 0) {
+        cfg.sesFromEmail = `noreply@${domain}`;
+      }
+      if (verified) normalizeSenders(cfg);
       await cfg.save();
     }
 
@@ -236,6 +262,60 @@ router.put("/ses/from", async (req, res, next) => {
     }
     cfg.sesFromEmail = fromEmail;
     cfg.sesFromName = fromName;
+    await cfg.save();
+    res.json({ ok: true, config: cfg.toJSON() });
+  } catch (err) { next(err); }
+});
+
+// ---------- SES: Sender profiles (support@, sales@, …) ----------
+// Add a sender profile on the verified domain.
+router.post("/ses/senders", async (req, res, next) => {
+  try {
+    const cfg = await loadConfig(req);
+    if (!cfg?.sesDomain) return res.status(400).json({ error: "Attach and verify a domain first." });
+
+    const email = cleanEmail(req.body?.email);
+    const name = String(req.body?.name || "").trim();
+    if (!email) return res.status(400).json({ error: "Enter a valid sender email (e.g. sales@yourdomain.com)" });
+    if (!emailOnDomain(email, cfg.sesDomain)) {
+      return res.status(400).json({ error: `Sender must be on your verified domain (@${cfg.sesDomain})` });
+    }
+    if (!Array.isArray(cfg.senders)) cfg.senders = [];
+    if (cfg.senders.some((s) => (s.email || "").toLowerCase() === email)) {
+      return res.status(409).json({ error: "That sender already exists." });
+    }
+    const makeDefault = cfg.senders.length === 0 || !!req.body?.isDefault;
+    if (makeDefault) cfg.senders.forEach((s) => { s.isDefault = false; });
+    cfg.senders.push({ name, email, isDefault: makeDefault });
+    normalizeSenders(cfg);
+    await cfg.save();
+    res.status(201).json({ ok: true, config: cfg.toJSON() });
+  } catch (err) { next(err); }
+});
+
+// Mark a sender profile as the default.
+router.put("/ses/senders/:sid/default", async (req, res, next) => {
+  try {
+    const cfg = await loadConfig(req);
+    const target = cfg && Array.isArray(cfg.senders) ? cfg.senders.id(req.params.sid) : null;
+    if (!target) return res.status(404).json({ error: "Sender not found" });
+    cfg.senders.forEach((s) => { s.isDefault = String(s._id) === String(req.params.sid); });
+    normalizeSenders(cfg);
+    await cfg.save();
+    res.json({ ok: true, config: cfg.toJSON() });
+  } catch (err) { next(err); }
+});
+
+// Delete a sender profile.
+router.delete("/ses/senders/:sid", async (req, res, next) => {
+  try {
+    const cfg = await loadConfig(req);
+    const target = cfg && Array.isArray(cfg.senders) ? cfg.senders.id(req.params.sid) : null;
+    if (!target) return res.status(404).json({ error: "Sender not found" });
+    const wasDefault = target.isDefault;
+    cfg.senders.pull(req.params.sid);
+    if (wasDefault && cfg.senders.length) cfg.senders[0].isDefault = true;
+    normalizeSenders(cfg);
     await cfg.save();
     res.json({ ok: true, config: cfg.toJSON() });
   } catch (err) { next(err); }
@@ -486,17 +566,21 @@ router.get("/campaigns/:id", async (req, res, next) => {
       .populate("template", "name")
       .populate("recipients", "name email status");
     if (!camp) return res.status(404).json({ error: "Campaign not found" });
-    res.json({ campaign: camp });
+    // Resolve the human-readable "from" for this campaign's chosen sender.
+    const cfg = await loadConfig(req);
+    const from = cfg ? resolveSender(cfg, camp.senderId) : null;
+    res.json({ campaign: camp, from });
   } catch (err) { next(err); }
 });
 
 router.post("/campaigns", async (req, res, next) => {
   try {
-    const { name, subject, body, templateId, recipientIds = [] } = req.body || {};
+    const { name, subject, body, templateId, recipientIds = [], senderId = "" } = req.body || {};
     if (!name || !subject || !body) return res.status(400).json({ error: "name, subject, body required" });
     const c = await EmailCampaign.create({
       user: req.user._id, name, subject, body,
       template: templateId || null,
+      senderId: senderId || "",
       recipients: recipientIds,
       status: "draft",
     });
@@ -540,6 +624,7 @@ router.post("/campaigns/:id/send", async (req, res, next) => {
         const info = await sendViaSes(cfg, {
           to: r.email,
           replyTo: cfg.replyTo || undefined,
+          senderId: camp.senderId || undefined,
           subject: renderTemplate(camp.subject, vars),
           html:    withSignature(renderTemplate(camp.body, vars), cfg, useSignature)
                      + openPixel(camp._id, r.email),
@@ -580,6 +665,106 @@ router.get("/stats", async (req, res, next) => {
       totalFailed,
       configured: sesReady(cfg),
     });
+  } catch (err) { next(err); }
+});
+
+// ---------- MAILBOX / INBOX ----------
+// List conversations (grouped by the other party), newest first, with unread counts.
+router.get("/inbox", async (req, res, next) => {
+  try {
+    const convos = await EmailMessage.aggregate([
+      { $match: { user: req.user._id } },
+      { $sort: { ts: -1 } },
+      {
+        $group: {
+          _id: "$counterparty",
+          lastSubject: { $first: "$subject" },
+          lastText:    { $first: "$text" },
+          lastDir:     { $first: "$direction" },
+          lastFromName:{ $first: "$fromName" },
+          ts:          { $first: "$ts" },
+          mailbox:     { $first: "$mailbox" },
+          total:       { $sum: 1 },
+          unread:      { $sum: { $cond: [{ $and: [{ $eq: ["$direction", "inbound"] }, { $eq: ["$read", false] }] }, 1, 0] } },
+        },
+      },
+      { $sort: { ts: -1 } },
+      { $limit: 200 },
+    ]);
+    res.json({
+      conversations: convos.map((c) => ({
+        counterparty: c._id,
+        name: c.lastFromName || "",
+        lastSubject: c.lastSubject || "",
+        preview: (c.lastText || "").replace(/\s+/g, " ").trim().slice(0, 120),
+        lastDirection: c.lastDir,
+        mailbox: c.mailbox || "",
+        ts: c.ts,
+        total: c.total,
+        unread: c.unread,
+      })),
+    });
+  } catch (err) { next(err); }
+});
+
+// Full thread with one counterparty (oldest → newest). Marks inbound as read.
+router.get("/inbox/:counterparty", async (req, res, next) => {
+  try {
+    const cp = String(req.params.counterparty || "").toLowerCase();
+    const messages = await EmailMessage.find({ user: req.user._id, counterparty: cp }).sort({ ts: 1 });
+    await EmailMessage.updateMany(
+      { user: req.user._id, counterparty: cp, direction: "inbound", read: false },
+      { $set: { read: true } }
+    );
+    res.json({ counterparty: cp, messages });
+  } catch (err) { next(err); }
+});
+
+// Compose / reply — sends via the user's SES domain and records the outbound message.
+router.post("/inbox/send", async (req, res, next) => {
+  try {
+    const to = cleanEmail(req.body?.to);
+    const subject = String(req.body?.subject || "").trim();
+    const html = String(req.body?.html || req.body?.body || "");
+    const senderId = req.body?.senderId || "";
+    const inReplyTo = String(req.body?.inReplyTo || "");
+    if (!to) return res.status(400).json({ error: "Recipient email required" });
+    if (!html.trim()) return res.status(400).json({ error: "Message body required" });
+
+    const cfg = await loadConfig(req);
+    if (!sesReady(cfg)) return res.status(400).json({ error: "Set up & verify your sending domain first." });
+
+    const sender = resolveSender(cfg, senderId);
+    const info = await sendViaSes(cfg, { to, subject: subject || "(no subject)", html, senderId });
+
+    const msg = await EmailMessage.create({
+      user: req.user._id,
+      organization: tenantId(req),
+      direction: "outbound",
+      mailbox: sender.email,
+      counterparty: to,
+      fromName: sender.name || "",
+      fromEmail: sender.email,
+      toEmails: [to],
+      subject: subject || "(no subject)",
+      html,
+      text: "",
+      messageId: info.messageId || "",
+      inReplyTo,
+      read: true,
+      ts: new Date(),
+    });
+    res.status(201).json({ ok: true, message: msg });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Unread count across the mailbox — for the sidebar badge.
+router.get("/inbox-unread", async (req, res, next) => {
+  try {
+    const unread = await EmailMessage.countDocuments({ user: req.user._id, direction: "inbound", read: false });
+    res.json({ unread });
   } catch (err) { next(err); }
 });
 

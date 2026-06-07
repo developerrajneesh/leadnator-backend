@@ -9,6 +9,9 @@ const Plan         = require("./models/Plan");
 const User         = require("./models/User");
 const GoogleAccount = require("./models/GoogleAccount");
 const EmailCampaign = require("./models/EmailCampaign");
+const EmailConfig   = require("./models/EmailConfig");
+const EmailMessage  = require("./models/EmailMessage");
+const { parseEmail } = require("./services/mimeParse");
 const googleSvc    = require("./services/google");
 
 const router = express.Router();
@@ -47,6 +50,76 @@ router.get("/email/open", async (req, res) => {
     console.warn(`[email open track] ${err.message}`);
   }
   res.end(TRACK_PIXEL);
+});
+
+// ---------- Inbound email webhook ----------
+// SES receipt rule (via Lambda/SNS) POSTs the raw MIME email here as
+// { rawEmail: "<raw>" } (or raw text). We parse it, find which user owns the
+// recipient address, and save it as an inbound message in their mailbox.
+// Always 200 so SES/Lambda doesn't retry on our parsing hiccups.
+function domainOf(addr = "") {
+  return String(addr).split("@")[1] || "";
+}
+
+router.post("/email/inbound", async (req, res) => {
+  try {
+    const raw =
+      (req.body && (req.body.rawEmail || req.body.content || req.body.email)) ||
+      (typeof req.body === "string" ? req.body : "");
+    if (!raw || raw.length < 10) return res.status(200).json({ ok: false, reason: "no rawEmail" });
+
+    const mail = parseEmail(raw);
+    const recipients = [...(mail.to || []), ...(mail.cc || [])];
+    if (!recipients.length) return res.status(200).json({ ok: false, reason: "no recipients" });
+
+    // Find the EmailConfig that owns one of the recipient addresses.
+    let cfg = null;
+    let mailbox = "";
+    for (const addr of recipients) {
+      cfg = await EmailConfig.findOne({
+        $or: [
+          { "senders.email": addr },
+          { sesFromEmail: addr },
+          { sesDomain: domainOf(addr) },
+        ],
+      });
+      if (cfg) { mailbox = addr; break; }
+    }
+    if (!cfg) {
+      console.warn(`[inbound] no mailbox owner for ${recipients.join(", ")}`);
+      return res.status(200).json({ ok: false, reason: "no owner" });
+    }
+
+    // De-dupe by Message-ID (SES can deliver twice).
+    if (mail.messageId) {
+      const dup = await EmailMessage.findOne({ user: cfg.user, messageId: mail.messageId, direction: "inbound" });
+      if (dup) return res.status(200).json({ ok: true, duplicate: true });
+    }
+
+    const msg = await EmailMessage.create({
+      user: cfg.user,
+      organization: cfg.organization || null,
+      direction: "inbound",
+      mailbox,
+      counterparty: mail.from || "",
+      fromName: mail.fromName || "",
+      fromEmail: mail.from || "",
+      toEmails: recipients,
+      subject: mail.subject || "(no subject)",
+      text: (mail.text || "").trim(),
+      html: mail.html || "",
+      messageId: mail.messageId || "",
+      inReplyTo: mail.inReplyTo || "",
+      read: false,
+      ts: mail.date && !isNaN(mail.date) ? mail.date : new Date(),
+    });
+
+    console.log(`[inbound] saved mail from ${mail.from} → ${mailbox} (user ${cfg.user})`);
+    res.status(200).json({ ok: true, id: msg.id });
+  } catch (err) {
+    console.error("[inbound] failed:", err.message);
+    res.status(200).json({ ok: false, error: err.message });
+  }
 });
 
 // Best-effort branded confirmation email via Amazon SES (same mailer the
