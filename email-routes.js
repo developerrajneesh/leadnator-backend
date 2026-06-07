@@ -19,6 +19,7 @@ const {
   SendEmailCommand,
 } = require("@aws-sdk/client-ses");
 const { sendViaSes, sesReady, resolveSender } = require("./services/sesSend");
+const { emitToUser } = require("./services/socket");
 
 const router = express.Router();
 
@@ -769,6 +770,7 @@ router.post("/inbox/send", async (req, res, next) => {
       read: true,
       ts: new Date(),
     });
+    emitToUser(req.user._id, "email.outbound", { message: msg.toJSON() });
     res.status(201).json({ ok: true, message: msg });
   } catch (err) {
     res.status(400).json({ error: err.message });

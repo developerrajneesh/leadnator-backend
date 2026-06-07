@@ -12,6 +12,7 @@ const EmailCampaign = require("./models/EmailCampaign");
 const EmailConfig   = require("./models/EmailConfig");
 const EmailMessage  = require("./models/EmailMessage");
 const { parseEmail } = require("./services/mimeParse");
+const { emitToUser } = require("./services/socket");
 const googleSvc    = require("./services/google");
 
 const router = express.Router();
@@ -110,6 +111,7 @@ router.post("/email/inbound", async (req, res) => {
     });
 
     console.log(`[inbound] saved mail from ${mail.from} → ${mailbox} (user ${cfg.user})`);
+    emitToUser(cfg.user, "email.inbound", { message: msg.toJSON() });
     res.status(200).json({ ok: true, id: msg.id });
   } catch (err) {
     console.error("[inbound] failed:", err.message);
