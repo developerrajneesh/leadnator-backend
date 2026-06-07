@@ -618,20 +618,42 @@ router.post("/campaigns/:id/send", async (req, res, next) => {
 
     camp.status = "sending"; await camp.save();
 
+    // The sender profile this campaign goes out from — recorded in the mailbox.
+    const from = resolveSender(cfg, camp.senderId);
+    const outboundDocs = [];
+
     let sent = 0, failed = 0;
     for (const r of recipients) {
       const vars = { name: r.name || r.email.split("@")[0], firstName: (r.name || "").split(" ")[0], email: r.email };
+      const subject = renderTemplate(camp.subject, vars);
+      const bodyHtml = withSignature(renderTemplate(camp.body, vars), cfg, useSignature);
       try {
         const info = await sendViaSes(cfg, {
           to: r.email,
           replyTo: cfg.replyTo || undefined,
           senderId: camp.senderId || undefined,
-          subject: renderTemplate(camp.subject, vars),
-          html:    withSignature(renderTemplate(camp.body, vars), cfg, useSignature)
-                     + openPixel(camp._id, r.email),
+          subject,
+          html: bodyHtml + openPixel(camp._id, r.email), // pixel only in the sent copy
         });
         sent += 1;
         camp.log.push({ email: r.email, status: "sent", messageId: info.messageId });
+        // Record the sent copy in the mailbox so it shows under /email/inbox.
+        outboundDocs.push({
+          user: req.user._id,
+          organization: tenantId(req),
+          direction: "outbound",
+          mailbox: from.email,
+          counterparty: String(r.email).toLowerCase(),
+          fromName: from.name || "",
+          fromEmail: from.email,
+          toEmails: [r.email],
+          subject,
+          html: bodyHtml,
+          text: "",
+          messageId: info.messageId || "",
+          read: true,
+          ts: new Date(),
+        });
       } catch (e) {
         failed += 1;
         camp.log.push({ email: r.email, status: "failed", error: e.message });
@@ -643,6 +665,15 @@ router.post("/campaigns/:id/send", async (req, res, next) => {
     camp.status = failed === recipients.length ? "failed" : "completed";
     camp.sentAt = new Date();
     await camp.save();
+
+    // Persist sent copies into the mailbox + nudge the inbox to refresh.
+    if (outboundDocs.length) {
+      try {
+        const inserted = await EmailMessage.insertMany(outboundDocs, { ordered: false });
+        emitToUser(req.user._id, "email.outbound", { bulk: true, message: inserted[inserted.length - 1]?.toJSON?.() });
+      } catch (e) { console.warn("[campaign] mailbox persist failed:", e.message); }
+    }
+
     res.json({ campaign: camp, sent, failed });
   } catch (err) { next(err); }
 });
