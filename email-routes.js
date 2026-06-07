@@ -669,6 +669,15 @@ router.get("/stats", async (req, res, next) => {
 });
 
 // ---------- MAILBOX / INBOX ----------
+// Strip quoted reply history ("On … wrote:" + > lines) for clean previews.
+function stripQuotedText(text) {
+  const t = String(text || "");
+  const m = t.search(/\n\s*On\b[\s\S]{0,300}?\bwrote:/);
+  let cut = m >= 0 ? t.slice(0, m) : t;
+  cut = cut.split(/\r?\n/).filter((l) => !/^\s*>/.test(l)).join("\n");
+  return cut.trim();
+}
+
 // List conversations (grouped by the other party), newest first, with unread counts.
 router.get("/inbox", async (req, res, next) => {
   try {
@@ -696,7 +705,7 @@ router.get("/inbox", async (req, res, next) => {
         counterparty: c._id,
         name: c.lastFromName || "",
         lastSubject: c.lastSubject || "",
-        preview: (c.lastText || "").replace(/\s+/g, " ").trim().slice(0, 120),
+        preview: stripQuotedText(c.lastText || "").replace(/\s+/g, " ").trim().slice(0, 120),
         lastDirection: c.lastDir,
         mailbox: c.mailbox || "",
         ts: c.ts,
