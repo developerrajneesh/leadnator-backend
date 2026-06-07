@@ -681,8 +681,11 @@ function stripQuotedText(text) {
 // List conversations (grouped by the other party), newest first, with unread counts.
 router.get("/inbox", async (req, res, next) => {
   try {
+    const mailbox = String(req.query.mailbox || "").toLowerCase().trim();
+    const match = { user: req.user._id };
+    if (mailbox) match.mailbox = mailbox;
     const convos = await EmailMessage.aggregate([
-      { $match: { user: req.user._id } },
+      { $match: match },
       { $sort: { ts: -1 } },
       {
         $group: {
@@ -720,9 +723,12 @@ router.get("/inbox", async (req, res, next) => {
 router.get("/inbox/:counterparty", async (req, res, next) => {
   try {
     const cp = String(req.params.counterparty || "").toLowerCase();
-    const messages = await EmailMessage.find({ user: req.user._id, counterparty: cp }).sort({ ts: 1 });
+    const mailbox = String(req.query.mailbox || "").toLowerCase().trim();
+    const filter = { user: req.user._id, counterparty: cp };
+    if (mailbox) filter.mailbox = mailbox;
+    const messages = await EmailMessage.find(filter).sort({ ts: 1 });
     await EmailMessage.updateMany(
-      { user: req.user._id, counterparty: cp, direction: "inbound", read: false },
+      { ...filter, direction: "inbound", read: false },
       { $set: { read: true } }
     );
     res.json({ counterparty: cp, messages });

@@ -72,22 +72,17 @@ router.post("/email/inbound", async (req, res) => {
     const recipients = [...(mail.to || []), ...(mail.cc || [])];
     if (!recipients.length) return res.status(200).json({ ok: false, reason: "no recipients" });
 
-    // Find the EmailConfig that owns one of the recipient addresses.
+    // Only accept mail addressed to a sender profile the user actually created.
+    // Mail to any other address on the domain is ignored (not saved).
     let cfg = null;
     let mailbox = "";
     for (const addr of recipients) {
-      cfg = await EmailConfig.findOne({
-        $or: [
-          { "senders.email": addr },
-          { sesFromEmail: addr },
-          { sesDomain: domainOf(addr) },
-        ],
-      });
+      cfg = await EmailConfig.findOne({ "senders.email": addr });
       if (cfg) { mailbox = addr; break; }
     }
     if (!cfg) {
-      console.warn(`[inbound] no mailbox owner for ${recipients.join(", ")}`);
-      return res.status(200).json({ ok: false, reason: "no owner" });
+      console.warn(`[inbound] ignored — no sender profile for ${recipients.join(", ")}`);
+      return res.status(200).json({ ok: false, reason: "no matching sender profile" });
     }
 
     // De-dupe by Message-ID (SES can deliver twice).
