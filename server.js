@@ -286,7 +286,6 @@ app.use("/api/autopilot", authRequired, autopilotRoutes);
 // the email doesn't exist, to avoid leaking which addresses have accounts.
 app.post("/api/auth/forgot-password", ah(async (req, res) => {
   const crypto = require("crypto");
-  const nodemailer = require("nodemailer");
 
   const email = String(req.body?.email || "").trim().toLowerCase();
   if (!email) return res.status(400).json({ error: "Email required" });
@@ -303,18 +302,12 @@ app.post("/api/auth/forgot-password", ah(async (req, res) => {
     const appUrl = (process.env.CLIENT_URL || "http://localhost:5173").replace(/\/$/, "");
     const resetLink = `${appUrl}/reset-password/${rawToken}`;
 
-    // Send via the SMTP creds in backend/.env. If missing, log the link so
-    // devs can copy-paste it during local testing.
-    const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM } = process.env;
-    if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
+    // Send via Amazon SES (see services/mailer.js). If SES isn't configured,
+    // log the link so devs can copy-paste it during local testing.
+    const { sendSystemMail, getMailer } = require("./services/mailer");
+    if (getMailer()) {
       try {
-        const transporter = nodemailer.createTransport({
-          host: SMTP_HOST, port: Number(SMTP_PORT) || 587,
-          secure: Number(SMTP_PORT) === 465,
-          auth: { user: SMTP_USER, pass: SMTP_PASS },
-        });
-        await transporter.sendMail({
-          from: SMTP_FROM || `"Leadnator" <${SMTP_USER}>`,
+        await sendSystemMail({
           to: email,
           subject: "Reset your Leadnator password",
           html: `
@@ -336,8 +329,8 @@ app.post("/api/auth/forgot-password", ah(async (req, res) => {
         console.warn(`[auth] failed to send reset email: ${err.message}. Reset link: ${resetLink}`);
       }
     } else {
-      // No SMTP configured — surface the link in the console for dev.
-      console.log(`\n[auth] PASSWORD RESET for ${email}\n  Link: ${resetLink}\n  (Configure SMTP_HOST / SMTP_USER / SMTP_PASS in backend/.env to email it instead)\n`);
+      // No SES configured — surface the link in the console for dev.
+      console.log(`\n[auth] PASSWORD RESET for ${email}\n  Link: ${resetLink}\n  (Configure AWS_REGION / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in backend/.env to email it instead)\n`);
     }
   }
 

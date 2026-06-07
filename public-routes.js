@@ -8,22 +8,54 @@ const CalendarEvent = require("./models/CalendarEvent");
 const Plan         = require("./models/Plan");
 const User         = require("./models/User");
 const GoogleAccount = require("./models/GoogleAccount");
+const EmailCampaign = require("./models/EmailCampaign");
 const googleSvc    = require("./services/google");
 
 const router = express.Router();
 
-// Best-effort branded confirmation email via the system SMTP creds (same ones
-// the password-reset flow uses). Silent no-op when SMTP isn't configured.
-async function sendMail(to, subject, html) {
-  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM } = process.env;
-  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !to) return;
+// ---------- Email open tracking ----------
+// 1x1 transparent GIF served on every campaign email open. The pixel URL is
+// embedded per-recipient at send time. We count the FIRST open per recipient
+// as a unique open and bump campaign.opens. Always returns the pixel, even on
+// error, so the email never shows a broken image.
+const TRACK_PIXEL = Buffer.from(
+  "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7",
+  "base64"
+);
+
+router.get("/email/open", async (req, res) => {
+  res.set("Content-Type", "image/gif");
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, private");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
   try {
-    const nodemailer = require("nodemailer");
-    const transporter = nodemailer.createTransport({
-      host: SMTP_HOST, port: Number(SMTP_PORT) || 587, secure: Number(SMTP_PORT) === 465,
-      auth: { user: SMTP_USER, pass: SMTP_PASS },
-    });
-    await transporter.sendMail({ from: SMTP_FROM || `"Leadnator" <${SMTP_USER}>`, to, subject, html });
+    const campaignId = String(req.query.c || "");
+    let email = "";
+    try { email = Buffer.from(String(req.query.r || ""), "base64url").toString("utf8").toLowerCase(); } catch {}
+    if (/^[a-f0-9]{24}$/i.test(campaignId) && email) {
+      const camp = await EmailCampaign.findById(campaignId);
+      if (camp) {
+        const entry = (camp.log || []).find((l) => (l.email || "").toLowerCase() === email);
+        if (entry && !entry.openedAt) {
+          entry.openedAt = new Date();
+          camp.opens = (camp.opens || 0) + 1;
+          await camp.save();
+        }
+      }
+    }
+  } catch (err) {
+    console.warn(`[email open track] ${err.message}`);
+  }
+  res.end(TRACK_PIXEL);
+});
+
+// Best-effort branded confirmation email via Amazon SES (same mailer the
+// password-reset flow uses). Silent no-op when SES isn't configured.
+const { sendSystemMail } = require("./services/mailer");
+async function sendMail(to, subject, html) {
+  if (!to) return;
+  try {
+    await sendSystemMail({ to, subject, html });
   } catch (err) {
     console.warn(`[booking email] failed: ${err.message}`);
   }

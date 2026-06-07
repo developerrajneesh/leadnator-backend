@@ -1,8 +1,7 @@
-// Email Marketing routes — per-user SMTP via Nodemailer + templates +
-// subscribers + campaigns + bulk send.
+// Email Marketing routes — per-user Amazon SES (the user attaches & verifies
+// their own domain) + templates + subscribers + campaigns + bulk send.
 
 const express = require("express");
-const nodemailer = require("nodemailer");
 const EmailConfig     = require("./models/EmailConfig");
 const EmailTemplate   = require("./models/EmailTemplate");
 const EmailSubscriber = require("./models/EmailSubscriber");
@@ -18,6 +17,7 @@ const {
   GetIdentityDkimAttributesCommand,
   SendEmailCommand,
 } = require("@aws-sdk/client-ses");
+const { sendViaSes, sesReady } = require("./services/sesSend");
 
 const router = express.Router();
 
@@ -70,26 +70,25 @@ async function loadConfig(req) {
   return cfg;
 }
 
-function makeTransporter(cfg) {
-  return nodemailer.createTransport({
-    host: cfg.host,
-    port: cfg.port,
-    secure: !!cfg.secure,
-    auth: { user: cfg.username, pass: cfg.password },
-  });
-}
-
-function fromHeader(cfg) {
-  if (cfg.fromName && cfg.fromEmail) return `"${cfg.fromName}" <${cfg.fromEmail}>`;
-  return cfg.fromEmail || cfg.username;
-}
-
 // Render simple {{var}} placeholders. `vars` may be an object or a Map-like.
 function renderTemplate(text = "", vars = {}) {
   return String(text).replace(/\{\{\s*([\w.]+)\s*\}\}/g, (_, k) => {
     const v = vars?.[k];
     return v === undefined || v === null ? "" : String(v);
   });
+}
+
+// Public base URL the backend is reachable at (for email open-tracking pixels).
+// In production set API_PUBLIC_URL to your deployed backend URL — a localhost
+// pixel won't load in real inboxes, so opens won't track in local dev.
+function trackingBase() {
+  return (process.env.API_PUBLIC_URL || `http://localhost:${process.env.PORT || 8080}`).replace(/\/$/, "");
+}
+
+// Invisible 1x1 open-tracking pixel, unique per (campaign, recipient).
+function openPixel(campaignId, email) {
+  const r = Buffer.from(String(email), "utf8").toString("base64url");
+  return `<img src="${trackingBase()}/api/public/email/open?c=${campaignId}&r=${r}" width="1" height="1" alt="" style="display:none;max-width:0;max-height:0;opacity:0" />`;
 }
 
 // Append the saved signature HTML (with a divider) when enabled and non-empty.
@@ -203,6 +202,9 @@ router.get("/ses/domain/status", async (req, res, next) => {
       cfg.sesVerified = verified;
       cfg.sesStatus = `Identity: ${verificationStatus} · DKIM: ${dkimStatus}`;
       cfg.sesLastCheckedAt = new Date();
+      // Once verified, default a sender on the domain if the user hasn't set one,
+      // so sending works immediately (and never falls back to old SMTP).
+      if (verified && !cfg.sesFromEmail) cfg.sesFromEmail = `noreply@${domain}`;
       await cfg.save();
     }
 
@@ -301,26 +303,6 @@ router.post("/ses/test-send", async (req, res, next) => {
   }
 });
 
-router.post("/config/test", async (req, res, next) => {
-  try {
-    const cfg = await loadConfig(req);
-    if (!cfg) return res.status(400).json({ error: "Save SMTP config first." });
-    if (!cfg.password) return res.status(400).json({ error: "Set the SMTP password before testing." });
-
-    const transporter = makeTransporter(cfg);
-    try {
-      await transporter.verify();
-      cfg.verified = true; cfg.verifiedAt = new Date(); cfg.lastError = "";
-      await cfg.save();
-      res.json({ ok: true, message: "SMTP connection verified successfully." });
-    } catch (err) {
-      cfg.verified = false; cfg.lastError = err.message;
-      await cfg.save();
-      res.status(400).json({ ok: false, error: err.message });
-    }
-  } catch (err) { next(err); }
-});
-
 // Save signature (and toggle) — kept inside EmailConfig.signature
 router.put("/signature", async (req, res, next) => {
   try {
@@ -348,17 +330,16 @@ router.post("/quick-send", async (req, res, next) => {
     if (!html?.trim())    return res.status(400).json({ error: "Message body required" });
 
     const cfg = await loadConfig(req);
-    if (!cfg)          return res.status(400).json({ error: "No SMTP config — open /email/config first." });
-    if (!cfg.password) return res.status(400).json({ error: "SMTP password not set — open /email/config." });
+    if (!sesReady(cfg)) {
+      return res.status(400).json({ error: "Set up your sending domain under Email → Config first." });
+    }
 
-    const transporter = makeTransporter(cfg);
     try {
-      const info = await transporter.sendMail({
-        from: fromHeader(cfg),
+      const info = await sendViaSes(cfg, {
         to,
-        replyTo: cfg.replyTo || undefined,
         subject,
         html: withSignature(html, cfg, useSignature !== false),
+        replyTo: cfg.replyTo || undefined,
       });
       EmailLog.create({ user: req.user._id, to, subject, html, messageId: info.messageId, status: "sent" })
         .catch((e) => console.warn("[email log] persist failed:", e.message));
@@ -383,30 +364,6 @@ router.get("/quick-send/history", async (req, res, next) => {
     const logs = await EmailLog.find({ user: req.user._id, to }).sort({ ts: -1 }).limit(limit);
     res.json({ history: logs.map((l) => l.toJSON()).reverse() });
   } catch (err) { next(err); }
-});
-
-router.post("/config/test-send", async (req, res, next) => {
-  try {
-    const { to } = req.body || {};
-    if (!to) return res.status(400).json({ error: "to email required" });
-    const cfg = await loadConfig(req);
-    if (!cfg?.password) return res.status(400).json({ error: "Save SMTP config + password first." });
-
-    const transporter = makeTransporter(cfg);
-    const info = await transporter.sendMail({
-      from: fromHeader(cfg),
-      to,
-      replyTo: cfg.replyTo || undefined,
-      subject: "Test email from Leadnator",
-      html: withSignature(
-        `<p>Hello!</p><p>This is a test email from your Leadnator SMTP config.</p><p>If you got this, your setup works ✅.</p>`,
-        cfg, true
-      ),
-    });
-    res.json({ ok: true, messageId: info.messageId });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
 });
 
 // ---------- TEMPLATES ----------
@@ -522,6 +479,17 @@ router.get("/campaigns", async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// Single campaign + its per-recipient delivery log (for the detail/analytics view).
+router.get("/campaigns/:id", async (req, res, next) => {
+  try {
+    const camp = await EmailCampaign.findOne({ _id: req.params.id, user: req.user._id })
+      .populate("template", "name")
+      .populate("recipients", "name email status");
+    if (!camp) return res.status(404).json({ error: "Campaign not found" });
+    res.json({ campaign: camp });
+  } catch (err) { next(err); }
+});
+
 router.post("/campaigns", async (req, res, next) => {
   try {
     const { name, subject, body, templateId, recipientIds = [] } = req.body || {};
@@ -548,8 +516,8 @@ router.delete("/campaigns/:id", async (req, res, next) => {
 router.post("/campaigns/:id/send", async (req, res, next) => {
   try {
     const cfg = await loadConfig(req);
-    if (!cfg?.password) {
-      return res.status(400).json({ error: "Set up SMTP config first under Email → Config." });
+    if (!sesReady(cfg)) {
+      return res.status(400).json({ error: "Set up & verify your sending domain under Email → Config first." });
     }
     const camp = await EmailCampaign.findOne({ _id: req.params.id, user: req.user._id })
       .populate("recipients", "name email status");
@@ -563,19 +531,18 @@ router.post("/campaigns/:id/send", async (req, res, next) => {
     const signatureSet = !!cfg?.signature?.html?.trim();
     const useSignature = req.body?.useSignature === false ? false : (signatureSet && cfg.signature.enabled);
 
-    const transporter = makeTransporter(cfg);
     camp.status = "sending"; await camp.save();
 
     let sent = 0, failed = 0;
     for (const r of recipients) {
       const vars = { name: r.name || r.email.split("@")[0], firstName: (r.name || "").split(" ")[0], email: r.email };
       try {
-        const info = await transporter.sendMail({
-          from: fromHeader(cfg),
+        const info = await sendViaSes(cfg, {
           to: r.email,
           replyTo: cfg.replyTo || undefined,
           subject: renderTemplate(camp.subject, vars),
-          html:    withSignature(renderTemplate(camp.body, vars), cfg, useSignature),
+          html:    withSignature(renderTemplate(camp.body, vars), cfg, useSignature)
+                     + openPixel(camp._id, r.email),
         });
         sent += 1;
         camp.log.push({ email: r.email, status: "sent", messageId: info.messageId });
@@ -611,7 +578,7 @@ router.get("/stats", async (req, res, next) => {
       templates,
       totalSent,
       totalFailed,
-      configured: !!(cfg && cfg.verified),
+      configured: sesReady(cfg),
     });
   } catch (err) { next(err); }
 });

@@ -13,7 +13,7 @@ const schema = new mongoose.Schema(
     failed:      { type: Number, default: 0 },
     opens:       { type: Number, default: 0 },
     clicks:      { type: Number, default: 0 },
-    log:         [{ email: String, status: String, error: String, ts: { type: Date, default: Date.now }, messageId: String }],
+    log:         [{ email: String, status: String, error: String, ts: { type: Date, default: Date.now }, messageId: String, openedAt: { type: Date, default: null } }],
     scheduledAt: { type: Date },
     sentAt:      { type: Date },
   },

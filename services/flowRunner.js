@@ -6,13 +6,13 @@
 //   • Email  — EmailConfig (host/port/user/pass) scoped to user._id
 //   • WhatsApp — WhatsAppConnection (phoneNumberId + accessToken) scoped to user._id
 
-const nodemailer = require("nodemailer");
 const axios = require("axios");
 const { VM } = require("vm2");
 
 const LeadFlow = require("../models/LeadFlow");
 const Lead = require("../models/Lead");
 const EmailConfig = require("../models/EmailConfig");
+const { sendViaSes, sesReady } = require("./sesSend");
 const EmailTemplate = require("../models/EmailTemplate");
 const WhatsAppConnection = require("../models/WhatsAppConnection");
 const WhatsAppMessage = require("../models/WhatsAppMessage");
@@ -41,9 +41,12 @@ function leadVars(lead) {
 async function sendEmail({ user, lead, config }) {
   if (!lead.email) return { ok: false, message: "Lead has no email address" };
   const userId = user._id || user;
-  const cfg = await EmailConfig.findOne({ user: userId }).select("+password");
-  if (!cfg) return { ok: false, message: "No SMTP config — open /email/config and save your creds." };
-  if (!cfg.password) return { ok: false, message: "SMTP password not set — open /email/config." };
+  // Prefer the user's verified-domain config; fall back to any config doc.
+  let cfg = await EmailConfig.findOne({ user: userId, sesVerified: true });
+  if (!cfg) cfg = await EmailConfig.findOne({ user: userId });
+  if (!sesReady(cfg)) {
+    return { ok: false, message: "No verified sending domain — open /email/config and set up SES." };
+  }
 
   let subject = config.subject || "Hello {{firstName}}";
   let body    = config.body    || "Hi {{firstName}}, thanks for reaching out.";
@@ -53,21 +56,13 @@ async function sendEmail({ user, lead, config }) {
   }
 
   const vars = leadVars(lead);
-  const transporter = nodemailer.createTransport({
-    host: cfg.host, port: cfg.port, secure: !!cfg.secure,
-    auth: { user: cfg.username, pass: cfg.password },
-  });
-  const fromHeader = cfg.fromName && cfg.fromEmail
-    ? `"${cfg.fromName}" <${cfg.fromEmail}>` : (cfg.fromEmail || cfg.username);
-
   let html = render(body, vars);
   if (cfg.signature?.html && cfg.signature?.enabled) {
     html += `\n<div style="margin-top:24px;padding-top:14px;border-top:1px solid #e5e7eb;color:#6b7280;font-family:Arial,sans-serif">${cfg.signature.html}</div>`;
   }
 
   try {
-    const info = await transporter.sendMail({
-      from: fromHeader,
+    const info = await sendViaSes(cfg, {
       to: lead.email,
       replyTo: cfg.replyTo || undefined,
       subject: render(subject, vars),
@@ -75,7 +70,7 @@ async function sendEmail({ user, lead, config }) {
     });
     return { ok: true, message: `Email → ${lead.email} (id ${info.messageId})` };
   } catch (err) {
-    return { ok: false, message: `SMTP error: ${err.message}` };
+    return { ok: false, message: `SES error: ${err.message}` };
   }
 }
 

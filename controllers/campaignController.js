@@ -1,19 +1,6 @@
-const nodemailer = require("nodemailer");
 const Campaign = require("../models/Campaign");
 const Lead = require("../models/Lead");
-
-let transporter = null;
-function getTransporter() {
-  if (transporter) return transporter;
-  if (!process.env.SMTP_HOST) return null;
-  transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: +(process.env.SMTP_PORT || 587),
-    secure: false,
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-  });
-  return transporter;
-}
+const { getMailer, defaultFrom } = require("../services/mailer");
 
 exports.list = async (req, res) => {
   const items = await Campaign.find({ owner: req.user._id }).sort({ createdAt: -1 });
@@ -46,7 +33,7 @@ exports.send = async (req, res) => {
   if (!campaign) return res.status(404).json({ error: "Not found" });
 
   const leads = await Lead.find({ owner: req.user._id, email: { $ne: "" } });
-  const t = getTransporter();
+  const t = getMailer();
 
   let sent = 0;
   for (const lead of leads) {
@@ -54,7 +41,7 @@ exports.send = async (req, res) => {
     try {
       if (t) {
         await t.sendMail({
-          from:    process.env.MAIL_FROM,
+          from:    defaultFrom(),
           to:      lead.email,
           subject: campaign.subject || campaign.name,
           html:    body,
