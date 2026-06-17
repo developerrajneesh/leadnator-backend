@@ -83,11 +83,20 @@ schema.statics.forScope = async function (userId, organizationId = null) {
   }
 
   if (!doc) {
-    doc = await this.create({
-      user: userId,
-      organization: orgId,
-      pipelineStages: DEFAULT_PIPELINE_STAGES.map((s) => ({ ...s })),
-    });
+    try {
+      doc = await this.create({
+        user: userId,
+        organization: orgId,
+        pipelineStages: DEFAULT_PIPELINE_STAGES.map((s) => ({ ...s })),
+      });
+    } catch (err) {
+      // A legacy unique-on-user index (or a concurrent create) can reject this.
+      // Fall back to the user's existing settings doc so the page still loads.
+      if (err && err.code === 11000) {
+        doc = await this.findOne(scopeQuery(userId, orgId)) || await this.findOne({ user: userId });
+      }
+      if (!doc) throw err;
+    }
   }
   if (!doc.pipelineStages?.length) {
     doc.pipelineStages = DEFAULT_PIPELINE_STAGES.map((s) => ({ ...s }));

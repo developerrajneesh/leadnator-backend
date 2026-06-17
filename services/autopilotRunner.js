@@ -16,10 +16,46 @@ const axios = require("axios");
 const { VM } = require("vm2");
 const EmailConfig = require("../models/EmailConfig");
 const EmailMessage = require("../models/EmailMessage");
+const Lead = require("../models/Lead");
 const { sendViaSes, sesReady, resolveSender } = require("./sesSend");
 const { emitToUser } = require("./socket");
 
 const isBranch = (t) => t === "condition.if_else";
+
+// Wait helpers. setTimeout caps at ~24.8 days (32-bit ms); enough for
+// minutes/hours/days. Note: timers are in-memory — a server restart drops
+// pending waits, and serverless (Vercel) won't run them after the response.
+const MAX_TIMER_MS = 2147483647;
+function waitDurationMs(c = {}) {
+  const amt = Math.max(0, Number(c.amount || 0));
+  const unit = c.unit || "minutes";
+  const mult = unit === "days" ? 86400000 : unit === "hours" ? 3600000 : 60000;
+  return amt * mult;
+}
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.min(ms, MAX_TIMER_MS)));
+}
+
+// Resolve a value from the payload given a config spec — supports a {{template}},
+// a dotted path ("contact.email"), a direct key ("email"), and a list of
+// fallback candidate keys (auto-detect when the user left the field blank).
+function resolveValue(spec, payload, candidates, interp) {
+  const v = String(spec || "").trim();
+  if (v) {
+    if (/\{\{/.test(v)) { const r = interp(v, payload).trim(); if (r) return r; }
+    const direct = payload?.[v];
+    if (direct != null && String(direct).trim()) return String(direct).trim();
+    if (v.includes(".")) {
+      let cur = payload;
+      for (const p of v.split(".")) cur = cur?.[p];
+      if (cur != null && String(cur).trim()) return String(cur).trim();
+    }
+  }
+  for (const cand of candidates || []) {
+    if (payload?.[cand] != null && String(payload[cand]).trim()) return String(payload[cand]).trim();
+  }
+  return "";
+}
 
 // Resolve the recipient email from the configured key. Supports a plain
 // payload key ("email"), a {{template}}, a dotted path ("contact.email"),
@@ -104,11 +140,6 @@ async function runNode(node, payload, ctx = {}) {
     return { payload: next, step: stepOf(node, "ok", input, next, applied.length ? `Mapped ${applied.join(", ")}` : "No field mappings set") };
   }
 
-  if (t === "wait.delay") {
-    const plan = `${c.amount || 0} ${c.unit || "minutes"}`;
-    return { step: stepOf(node, "ok", input, { waited: false, planned: plan }, `Would wait ${plan} (skipped in trace)`) };
-  }
-
   if (t === "action.call_webhook") {
     const url = interp(c.url, payload);
     if (!url) return { step: stepOf(node, "error", input, null, "No URL configured") };
@@ -134,16 +165,53 @@ async function runNode(node, payload, ctx = {}) {
     }
   }
 
+  if (t === "action.create_contact") {
+    const owner = ctx.owner;
+    if (!owner) return { step: stepOf(node, "error", input, null, "No owner on this autopilot") };
+    const email = resolveValue(c.emailField, payload, ["email", "Email", "email_address", "emailId", "user_email", "contact_email"], interp);
+    const name  = resolveValue(c.nameField,  payload, ["name", "Name", "full_name", "fullName", "firstName", "first_name"], interp);
+    const phone = resolveValue(c.phoneField, payload, ["phone", "Phone", "mobile", "phone_number", "contact_number", "whatsapp"], interp);
+    if (!email && !phone) {
+      return { step: stepOf(node, "error", input, { tried: { emailField: c.emailField || "auto", phoneField: c.phoneField || "auto" } }, "Couldn't find an email or phone in the payload to create a contact") };
+    }
+    const source = interp(c.list, payload) || "Autopilot";
+    try {
+      const filter = email ? { owner, email: email.toLowerCase() } : { owner, phone };
+      let lead = await Lead.findOne(filter);
+      const wasNew = !lead;
+      if (lead) {
+        if (name) lead.name = name;
+        if (email && !lead.email) lead.email = email.toLowerCase();
+        if (phone && !lead.phone) lead.phone = phone;
+        await lead.save();
+      } else {
+        lead = await Lead.create({
+          owner, organization: ctx.organization || null,
+          name: name || "", email: email ? email.toLowerCase() : "", phone: phone || "",
+          source, status: "new",
+        });
+      }
+      return { step: stepOf(node, "ok", input, { id: String(lead._id), email: lead.email, name: lead.name, phone: lead.phone }, `Contact ${wasNew ? "created" : "updated"} → ${email || phone}`) };
+    } catch (err) {
+      return { step: stepOf(node, "error", input, null, `Create contact failed: ${err.message}`) };
+    }
+  }
+
   // Integration actions — log the resolved config, don't dispatch.
   const resolved = {};
   for (const [k, v] of Object.entries(c)) resolved[k] = typeof v === "string" ? interp(v, payload) : v;
   return { step: stepOf(node, "logged", input, resolved, "Action logged (not dispatched in webhook trace run)") };
 }
 
-async function runAutopilot(ap, reqData = {}) {
+// Run a workflow. `onProgress(steps)` (optional) is awaited after each step so
+// the caller can persist progress — important for flows with real wait/delay
+// nodes that resolve over time.
+async function runAutopilot(ap, reqData = {}, onProgress) {
   const cfg = ap.config || {};
   const steps = [];
   let payload = { ...clone(reqData.query), ...clone(reqData.body) };
+
+  const report = async () => { try { await onProgress?.(steps); } catch { /* persist best-effort */ } };
 
   // Owner context — used by integration actions (e.g. send_email via SES).
   const owner = ap.createdBy;
@@ -156,6 +224,7 @@ async function runAutopilot(ap, reqData = {}) {
 
   if (cfg.trigger) {
     steps.push(stepOf(cfg.trigger, "ok", clone(payload), clone(payload), "Triggered"));
+    await report();
   }
 
   async function walk(list) {
@@ -165,12 +234,22 @@ async function runAutopilot(ap, reqData = {}) {
         const s = stepOf(node, "ok", clone(payload), { result: res }, `Condition → ${res ? "YES" : "NO"} branch`);
         s.branch = res ? "yes" : "no";
         steps.push(s);
+        await report();
         await walk(res ? node.yes : node.no);
         return; // a condition is terminal on its trunk
+      }
+      if (node.type === "wait.delay") {
+        const ms = waitDurationMs(node.config);
+        const label = `${node.config?.amount || 0} ${node.config?.unit || "minutes"}`;
+        steps.push(stepOf(node, "ok", clone(payload), { waitMs: ms }, ms > 0 ? `Waiting ${label}…` : "No wait set"));
+        await report();
+        if (ms > 0) await sleep(ms);
+        continue;
       }
       const r = await runNode(node, payload, ctx);
       steps.push(r.step);
       if (r.payload) payload = r.payload;
+      await report();
     }
   }
 

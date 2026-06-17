@@ -85,6 +85,31 @@ router.post("/switch", async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// Update workspace branding (name / logo) — owner or platform admin only.
+router.put("/:id", async (req, res, next) => {
+  try {
+    const orgId = String(req.params.id || "").trim();
+    if (!orgId) return res.status(400).json({ error: "organization id is required" });
+
+    const membership = await verifyMembership(req.user._id, orgId);
+    if (!membership) return res.status(404).json({ error: "Organization not found or access denied" });
+    if (membership.role !== "owner" && req.user.role !== "admin") {
+      return res.status(403).json({ error: "Only the workspace owner or admin can update this workspace" });
+    }
+
+    const set = {};
+    if (req.body?.name !== undefined) {
+      const name = String(req.body.name || "").trim();
+      if (name) set.name = name;
+    }
+    if (req.body?.logoUrl !== undefined) set.logoUrl = String(req.body.logoUrl || "").trim();
+
+    const org = await Organization.findByIdAndUpdate(orgId, { $set: set }, { new: true });
+    if (!org) return res.status(404).json({ error: "Organization not found" });
+    res.json({ organization: organizationPublic(org) });
+  } catch (err) { next(err); }
+});
+
 // Archive (soft-delete) an organization — only owner or platform admin can do this
 router.delete("/:id", async (req, res, next) => {
   try {

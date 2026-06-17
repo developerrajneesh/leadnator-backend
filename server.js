@@ -688,6 +688,15 @@ app.post("/api/campaigns", authRequired, ah(async (req, res) => {
 app.use("/api/meta", authRequired, metaRouter);
 app.use("/api/meta", metaErrorHandler);
 
+// ---------- CONVERSATIONS (unified Email + WhatsApp inbox, GHL-style) ----------
+app.use("/api/conversations", authRequired, require("./conversations-routes"));
+
+// ---------- META ADS (ported LCM campaign builder: Campaign → Ad Set → Ad) ----------
+// Larger JSON limit — image/video uploads arrive as base64 in the body.
+const metaAdsRouter = require("./meta-ads-routes");
+app.use("/api/meta-ads", authRequired, express.json({ limit: "60mb" }), metaAdsRouter);
+app.use("/api/meta-ads", metaErrorHandler);
+
 // ---------- AI (OpenAI content generator) ----------
 app.use("/api/ai", authRequired, aiRouter);
 
@@ -1176,6 +1185,22 @@ const PORT = Number(process.env.PORT) || 8080;
 connectDB()
   .then(async () => {
     const count = await User.countDocuments();
+
+    // One-time fix: older builds had a unique index on `user` alone in
+    // leadsettings (one settings doc per user). Multi-org now needs one doc
+    // per (user, organization), so drop the stale unique `user_1` index.
+    try {
+      const idx = await LeadSettings.collection.indexes();
+      const stale = idx.find((i) => i.name === "user_1" && i.unique);
+      if (stale) {
+        await LeadSettings.collection.dropIndex("user_1");
+        console.log("[migrate] dropped stale unique index leadsettings.user_1");
+      }
+      await LeadSettings.syncIndexes();
+    } catch (e) {
+      console.warn("[migrate] leadsettings index fix skipped:", e.message);
+    }
+
     const server = http.createServer(app);
     socketService.init(server);
     server.listen(PORT, () => {

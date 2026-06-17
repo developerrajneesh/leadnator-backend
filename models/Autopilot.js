@@ -14,6 +14,7 @@ const autopilotSchema = new mongoose.Schema({
   lastCalledAt: { type: Date },
   calls: [{
     _id: false,
+    runId: String,
     ts: { type: Date, default: Date.now },
     ip: String,
     method: String,
