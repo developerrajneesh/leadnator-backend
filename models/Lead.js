@@ -46,4 +46,26 @@ const leadSchema = new mongoose.Schema(
 leadSchema.index({ owner: 1, status: 1 });
 leadSchema.index({ owner: 1, createdAt: -1 });
 
+// Real-time notification on a brand-new lead. We flag "was new" in pre-save and
+// emit in post-save so every creation path (manual add, autopilot create
+// contact, form submit, etc. that uses .save()/.create()) pushes a live event.
+leadSchema.pre("save", function (next) {
+  this.$locals.wasNew = this.isNew;
+  next();
+});
+leadSchema.post("save", function (doc) {
+  if (!doc.$locals?.wasNew) return;
+  try {
+    const { emitToUser } = require("../services/socket");
+    const who = doc.name || doc.email || doc.phone || "New contact";
+    emitToUser(doc.owner, "notification:new", {
+      type: "lead",
+      title: `New lead from ${doc.source || "Manual"}`,
+      sub: `${who} · just now`,
+      ts: doc.createdAt || new Date(),
+      link: `/leads/all/${doc._id.toString()}`,
+    });
+  } catch { /* socket not ready — non-fatal */ }
+});
+
 module.exports = mongoose.models.Lead || mongoose.model("Lead", leadSchema);

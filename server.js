@@ -762,6 +762,110 @@ app.get("/api/dashboard/stats", authRequired, ah(async (req, res) => {
   });
 }));
 
+// ---------- Notifications (derived from real recent activity) ----------
+// No dedicated Notification collection — we synthesize a feed on the fly from
+// the user's most recent leads, finished campaigns and an upcoming renewal so
+// the header bell shows live data instead of dummy items.
+app.get("/api/notifications", authRequired, ah(async (req, res) => {
+  const Subscription = require("./models/Subscription");
+  // The header bell asks for a short list; the "all notifications" page asks
+  // for the full feed via ?limit=50.
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 8, 1), 50);
+  const fetchN = Math.max(limit, 8);
+  const lf = orgLeadFilter(req);
+  const [recentLeads, campaigns, sub] = await Promise.all([
+    Lead.find(lf).sort({ createdAt: -1 }).limit(fetchN),
+    Campaign.find({ owner: req.user._id }).sort({ updatedAt: -1 }).limit(fetchN),
+    Subscription.findOne({ user: req.user._id, status: "active" }).sort({ createdAt: -1 }),
+  ]);
+
+  const now = Date.now();
+  const timeAgo = (d) => {
+    const s = Math.max(1, Math.floor((now - new Date(d).getTime()) / 1000));
+    if (s < 60) return `${s}s ago`;
+    const m = Math.floor(s / 60); if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60); if (h < 24) return `${h}h ago`;
+    return `${Math.floor(h / 24)}d ago`;
+  };
+
+  const items = [];
+
+  for (const l of recentLeads) {
+    const who = l.name || l.email || l.phone || "New contact";
+    items.push({
+      type: "lead",
+      title: `New lead from ${l.source || "Manual"}`,
+      sub: `${who} · ${timeAgo(l.createdAt)}`,
+      ts: l.createdAt,
+      link: `/leads/all/${l._id.toString()}`,
+    });
+  }
+
+  for (const c of campaigns) {
+    if (c.status === "completed") {
+      items.push({
+        type: "campaign",
+        title: `Campaign '${c.name}' finished`,
+        sub: `${c.sent || 0} sent · ${timeAgo(c.updatedAt)}`,
+        ts: c.updatedAt,
+        link: "/email/campaigns",
+      });
+    }
+  }
+
+  if (sub?.expiresAt) {
+    const days = Math.ceil((new Date(sub.expiresAt).getTime() - now) / 86400000);
+    if (days >= 0 && days <= 7) {
+      items.push({
+        type: "billing",
+        title: `Your ${sub.planName} plan renews in ${days} day${days === 1 ? "" : "s"}`,
+        sub: "Manage subscription",
+        ts: sub.expiresAt,
+        link: "/pricing/plans",
+      });
+    }
+  }
+
+  // Attach a stable key + DB-backed read flag to each item.
+  const readKeys = new Set(req.user.notifReadKeys || []);
+  const readAt = req.user.notifReadAt ? new Date(req.user.notifReadAt).getTime() : 0;
+  for (const it of items) {
+    it.key = `${it.type}|${it.link || ""}|${new Date(it.ts).getTime()}`;
+    it.read = (readAt && new Date(it.ts).getTime() <= readAt) || readKeys.has(it.key);
+  }
+
+  items.sort((a, b) => new Date(b.ts) - new Date(a.ts));
+  const sliced = items.slice(0, limit);
+  res.json({
+    notifications: sliced,
+    count: items.length,
+    unread: items.filter((it) => !it.read).length,
+  });
+}));
+
+// Mark a single notification read (by its stable key).
+app.post("/api/notifications/read", authRequired, ah(async (req, res) => {
+  const key = (req.body?.key || "").toString();
+  if (!key) return res.status(400).json({ error: "key required" });
+  await User.updateOne(
+    { _id: req.user._id },
+    { $addToSet: { notifReadKeys: key } } // $addToSet dedupes automatically
+  );
+  // Keep the list bounded.
+  const u = await User.findById(req.user._id).select("notifReadKeys");
+  if (u && u.notifReadKeys.length > 300) {
+    u.notifReadKeys = u.notifReadKeys.slice(-300);
+    await u.save();
+  }
+  res.json({ ok: true });
+}));
+
+// Mark all notifications read (sets the "read up to" moment).
+app.post("/api/notifications/read-all", authRequired, ah(async (req, res) => {
+  await User.updateOne({ _id: req.user._id }, { $set: { notifReadAt: new Date() } });
+  res.json({ ok: true });
+}));
+
 // Rich overview — one-shot fetch for the dashboard pages. Pulls the user's
 // real leads + email campaigns + WhatsApp messages + Meta connection summary
 // + file storage totals so the UI doesn't need dummy data.
@@ -929,6 +1033,52 @@ app.get("/api/admin/users", authRequired, adminOnly, ah(async (_req, res) => {
   res.json({ users: payload });
 }));
 
+// ---------- Admin notifications (platform-wide activity) ----------
+app.get("/api/admin/notifications", authRequired, adminOnly, ah(async (req, res) => {
+  const Invoice = require("./models/Invoice");
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 8, 1), 50);
+  const fetchN = Math.max(limit, 8);
+  const [users, tickets, invoices] = await Promise.all([
+    User.find({ role: { $ne: "admin" } }).sort({ createdAt: -1 }).limit(fetchN),
+    Ticket.find().sort({ createdAt: -1 }).limit(fetchN),
+    Invoice.find({ status: "paid" }).sort({ paidAt: -1 }).limit(fetchN),
+  ]);
+
+  const now = Date.now();
+  const timeAgo = (d) => {
+    const s = Math.max(1, Math.floor((now - new Date(d).getTime()) / 1000));
+    if (s < 60) return `${s}s ago`;
+    const m = Math.floor(s / 60); if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60); if (h < 24) return `${h}h ago`;
+    return `${Math.floor(h / 24)}d ago`;
+  };
+
+  const items = [];
+  for (const u of users) {
+    items.push({ type: "user", title: `New signup · ${u.name}`, sub: `${u.email} · ${timeAgo(u.createdAt)}`, ts: u.createdAt, link: `/admin/users/${u._id.toString()}` });
+  }
+  for (const t of tickets) {
+    items.push({ type: "ticket", title: `New ticket · ${t.subject}`, sub: `${t.user} · ${timeAgo(t.createdAt)}`, ts: t.createdAt, link: "/admin/support" });
+  }
+  for (const inv of invoices) {
+    items.push({ type: "payment", title: `Payment received · ₹${Number(inv.amount || 0).toLocaleString("en-IN")}`, sub: `${inv.planName || "Subscription"} · ${timeAgo(inv.paidAt)}`, ts: inv.paidAt, link: "/admin/revenue" });
+  }
+
+  const readKeys = new Set(req.user.notifReadKeys || []);
+  const readAt = req.user.notifReadAt ? new Date(req.user.notifReadAt).getTime() : 0;
+  for (const it of items) {
+    it.key = `${it.type}|${it.link || ""}|${new Date(it.ts).getTime()}`;
+    it.read = (readAt && new Date(it.ts).getTime() <= readAt) || readKeys.has(it.key);
+  }
+
+  items.sort((a, b) => new Date(b.ts) - new Date(a.ts));
+  res.json({
+    notifications: items.slice(0, limit),
+    count: items.length,
+    unread: items.filter((it) => !it.read).length,
+  });
+}));
+
 app.put("/api/admin/users/:id", authRequired, adminOnly, ah(async (req, res) => {
   const { password, _id, id, ...rest } = req.body || {};
   const user = await User.findByIdAndUpdate(req.params.id, rest, { new: true, runValidators: true });
@@ -985,8 +1135,17 @@ app.get("/api/admin/users/:id", authRequired, adminOnly, ah(async (req, res) => 
     StorageItem.countDocuments({ user: uid, type: "file", deleted: false }),
     GoogleAccount.findOne({ user: uid }),
     Autopilot.countDocuments({ createdBy: uid }),
-    OrgMembership.find({ user: uid }).populate("organization", "name"),
+    OrgMembership.find({ user: uid }).populate("organization", "name createdAt"),
   ]);
+
+  // Per-workspace stats so the admin can drill into each one.
+  const orgIds = memberships.filter((m) => m.organization).map((m) => m.organization._id);
+  const [orgLeadCounts, orgMemberCounts] = await Promise.all([
+    Lead.aggregate([{ $match: { organization: { $in: orgIds } } }, { $group: { _id: "$organization", count: { $sum: 1 } } }]),
+    OrgMembership.aggregate([{ $match: { organization: { $in: orgIds } } }, { $group: { _id: "$organization", count: { $sum: 1 } } }]),
+  ]);
+  const leadByOrg   = orgLeadCounts.reduce((a, c) => ((a[c._id.toString()] = c.count), a), {});
+  const memberByOrg = orgMemberCounts.reduce((a, c) => ((a[c._id.toString()] = c.count), a), {});
 
   res.json({
     user: target.toJSON(),
@@ -1007,7 +1166,14 @@ app.get("/api/admin/users/:id", authRequired, adminOnly, ah(async (req, res) => 
     bookings: bookings.map((b) => ({ ...b.toJSON(), bookingTypeName: b.bookingType?.name || "" })),
     organizations: memberships
       .filter((m) => m.organization)
-      .map((m) => ({ id: m.organization._id.toString(), name: m.organization.name || "—", role: m.role })),
+      .map((m) => ({
+        id: m.organization._id.toString(),
+        name: m.organization.name || "—",
+        role: m.role,
+        leads: leadByOrg[m.organization._id.toString()] || 0,
+        members: memberByOrg[m.organization._id.toString()] || 0,
+        createdAt: m.organization.createdAt || null,
+      })),
     integrations: {
       whatsapp:  { connected: !!(waConn && waConn.phoneNumberId), number: waConn?.displayPhoneNumber || waConn?.phoneNumber || "" },
       instagram: { connected: !!igConn },
@@ -1015,6 +1181,119 @@ app.get("/api/admin/users/:id", authRequired, adminOnly, ah(async (req, res) => 
       storage:   { connected: !!(storageCfg && storageCfg.provider), provider: storageCfg?.provider || "" },
       google:    { connected: !!googleAcc, email: googleAcc?.email || "" },
     },
+  });
+}));
+
+// ---------- ADMIN PLANS (CRUD + per-plan stats) ----------
+app.get("/api/admin/plans", authRequired, adminOnly, ah(async (_req, res) => {
+  const [plans, users] = await Promise.all([
+    Plan.find().sort({ price: 1 }),
+    User.find({ role: { $ne: "admin" } }).select("plan status"),
+  ]);
+  const stats = plans.map((p) => {
+    const planUsers = users.filter((u) => u.plan === p.name);
+    const active = planUsers.filter((u) => u.status === "active").length;
+    return { ...p.toJSON(), userCount: planUsers.length, active, revenue: active * (p.price || 0) };
+  });
+  res.json({ plans: stats, totalUsers: users.length });
+}));
+
+app.post("/api/admin/plans", authRequired, adminOnly, ah(async (req, res) => {
+  const { key, name, price, leadLimit, popular, features, disabled, tagline } = req.body || {};
+  if (!key || !name || price == null) return res.status(400).json({ error: "key, name and price are required" });
+  if (await Plan.findOne({ key })) return res.status(409).json({ error: "A plan with this key already exists" });
+  const plan = await Plan.create({
+    key: String(key).trim(),
+    name: String(name).trim(),
+    price: Number(price) || 0,
+    leadLimit: Number(leadLimit) || 0,
+    popular: !!popular,
+    features: Array.isArray(features) ? features : [],
+    disabled: Array.isArray(disabled) ? disabled : [],
+    tagline: tagline || "",
+  });
+  res.status(201).json({ plan: plan.toJSON() });
+}));
+
+app.put("/api/admin/plans/:id", authRequired, adminOnly, ah(async (req, res) => {
+  const update = {};
+  for (const k of ["key", "name", "price", "leadLimit", "popular", "features", "disabled", "tagline"]) {
+    if (k in (req.body || {})) update[k] = req.body[k];
+  }
+  if (update.price != null) update.price = Number(update.price) || 0;
+  if (update.leadLimit != null) update.leadLimit = Number(update.leadLimit) || 0;
+  const plan = await Plan.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true });
+  if (!plan) return res.status(404).json({ error: "Plan not found" });
+  res.json({ plan: plan.toJSON() });
+}));
+
+app.delete("/api/admin/plans/:id", authRequired, adminOnly, ah(async (req, res) => {
+  const plan = await Plan.findByIdAndDelete(req.params.id);
+  if (!plan) return res.status(404).json({ error: "Plan not found" });
+  res.json({ deleted: true });
+}));
+
+// ---------- ADMIN REVENUE (live subscription + invoice analytics) ----------
+app.get("/api/admin/revenue", authRequired, adminOnly, ah(async (_req, res) => {
+  const Subscription = require("./models/Subscription");
+  const Invoice = require("./models/Invoice");
+  const DAY = 86400000;
+  const now = new Date();
+  const since = (d) => new Date(now.getTime() - d * DAY);
+
+  const activeSubs = await Subscription.find({ status: "active" }).select("amount months planName");
+  const monthlyValue = (s) => (s.months ? Math.round(s.amount / s.months) : s.amount);
+  const mrr = activeSubs.reduce((sum, s) => sum + monthlyValue(s), 0);
+  const arr = mrr * 12;
+  const arpu = activeSubs.length ? Math.round(mrr / activeSubs.length) : 0;
+
+  const [activeCount, pausedCount, churned30, failed30, refunds30] = await Promise.all([
+    Subscription.countDocuments({ status: "active" }),
+    Subscription.countDocuments({ status: "cancelled" }),
+    Subscription.countDocuments({ status: { $in: ["cancelled", "expired"] }, updatedAt: { $gte: since(30) } }),
+    Invoice.countDocuments({ status: "failed", createdAt: { $gte: since(30) } }),
+    Invoice.countDocuments({ status: "refunded", createdAt: { $gte: since(30) } }),
+  ]);
+  const churnRate = activeCount + churned30 ? +(((churned30 / (activeCount + churned30)) * 100).toFixed(1)) : 0;
+
+  // Daily revenue (paid invoices) — last 14 days.
+  const paid14 = await Invoice.find({ status: "paid", createdAt: { $gte: since(14) } }).select("amount createdAt");
+  const dayKey = (d) => new Date(d).toISOString().slice(0, 10);
+  const dailyMap = {};
+  for (let i = 13; i >= 0; i--) dailyMap[dayKey(since(i))] = 0;
+  for (const inv of paid14) { const k = dayKey(inv.createdAt); if (dailyMap[k] !== undefined) dailyMap[k] += inv.amount; }
+  const daily = Object.entries(dailyMap).map(([k, v]) => ({
+    label: new Date(k).toLocaleDateString("en-IN", { day: "numeric", month: "short" }), value: v,
+  }));
+
+  // Revenue (paid invoices) — last 6 months.
+  const monthly = [];
+  for (let i = 5; i >= 0; i--) {
+    const m = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const next = new Date(now.getFullYear(), now.getMonth() - i + 1, 1);
+    const agg = await Invoice.aggregate([
+      { $match: { status: "paid", createdAt: { $gte: m, $lt: next } } },
+      { $group: { _id: null, t: { $sum: "$amount" } } },
+    ]);
+    monthly.push({ label: m.toLocaleDateString("en-IN", { month: "short" }), value: agg[0]?.t || 0 });
+  }
+
+  // Recent transactions.
+  const recent = await Invoice.find().sort({ createdAt: -1 }).limit(20).populate("user", "name email");
+  const transactions = recent.map((inv) => ({
+    id: inv.number || String(inv._id),
+    user: inv.user?.name || inv.user?.email || "—",
+    plan: inv.planName || "—",
+    amount: inv.amount,
+    date: inv.paidAt || inv.createdAt,
+    status: inv.status,
+  }));
+
+  res.json({
+    mrr, arr, arpu, churnRate,
+    daily, monthly,
+    summary: { active: activeCount, paused: pausedCount, failed30, refunds30 },
+    transactions,
   });
 }));
 

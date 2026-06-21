@@ -160,12 +160,14 @@ router.post("/disconnect", async (req, res, next) => {
 // Instagram Business Login — exchange OAuth `code` → short-lived → long-lived (60d) → MongoDB
 router.post("/oauth/callback", async (req, res, next) => {
   try {
-    const { code } = req.body || {};
+    const { code, redirect_uri } = req.body || {};
     if (!code) return res.status(400).json({ error: "Authorization code required" });
 
     const clientId = process.env.INSTAGRAM_CLIENT_ID || "1973429443277994";
     const clientSecret = process.env.INSTAGRAM_CLIENT_SECRET || "4a0489054e165da08aa8503e977c7bd1";
-    const redirectUri = process.env.INSTAGRAM_REDIRECT_URI || "https://leadnator.vercel.app/";
+    // Must EXACTLY match the redirect_uri used at the authorize step. The client
+    // sends the one it actually used (its current origin); fall back to env.
+    const redirectUri = redirect_uri || process.env.INSTAGRAM_REDIRECT_URI || "https://leadnator.vercel.app/";
 
     if (!clientSecret) {
       return res.status(500).json({

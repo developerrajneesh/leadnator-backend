@@ -12,6 +12,11 @@ const userSchema = new mongoose.Schema(
     phone:    { type: String, default: "" },
     company:  { type: String, default: "" },
     joinedAt: { type: Date, default: Date.now },
+
+    // Notification read-state (DB-backed). `notifReadAt` = "mark all read"
+    // moment; `notifReadKeys` = individually opened notifications (capped).
+    notifReadAt:   { type: Date, default: null },
+    notifReadKeys: { type: [String], default: [] },
     // Password reset tokens — one-time, expire after 1 hour. Indexed for lookup.
     passwordResetToken:     { type: String, default: "", select: false, index: true },
     passwordResetExpiresAt: { type: Date, default: null, select: false },
