@@ -36,6 +36,27 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.min(ms, MAX_TIMER_MS)));
 }
 
+// Resolve a possibly-nested value from the payload. Supports:
+//   • flat keys        → "email"
+//   • dotted paths     → "data.email"
+//   • array indexes    → "data.source[0]"  or  "data.source.0"
+// Returns undefined if any segment along the way is missing.
+function getByPath(obj, path) {
+  if (obj == null || path == null || path === "") return undefined;
+  // A literal top-level key wins first (covers keys that contain dots/brackets).
+  if (Object.prototype.hasOwnProperty.call(obj, path)) return obj[path];
+  const parts = String(path)
+    .replace(/\[(\w+)\]/g, ".$1")   // data.source[0] → data.source.0
+    .split(".")
+    .filter((p) => p !== "");
+  let cur = obj;
+  for (const p of parts) {
+    if (cur == null) return undefined;
+    cur = cur[p];
+  }
+  return cur;
+}
+
 // Resolve a value from the payload given a config spec — supports a {{template}},
 // a dotted path ("contact.email"), a direct key ("email"), and a list of
 // fallback candidate keys (auto-detect when the user left the field blank).
@@ -45,9 +66,8 @@ function resolveValue(spec, payload, candidates, interp) {
     if (/\{\{/.test(v)) { const r = interp(v, payload).trim(); if (r) return r; }
     const direct = payload?.[v];
     if (direct != null && String(direct).trim()) return String(direct).trim();
-    if (v.includes(".")) {
-      let cur = payload;
-      for (const p of v.split(".")) cur = cur?.[p];
+    if (v.includes(".") || v.includes("[")) {
+      const cur = getByPath(payload, v);
       if (cur != null && String(cur).trim()) return String(cur).trim();
     }
   }
@@ -66,9 +86,8 @@ function resolveRecipient(to, payload, interp) {
   if (/\{\{/.test(v)) return interp(v, payload).trim();
   const direct = payload?.[v];
   if (direct != null && String(direct).includes("@")) return String(direct).trim();
-  if (v.includes(".")) {
-    let cur = payload;
-    for (const p of v.split(".")) cur = cur?.[p];
+  if (v.includes(".") || v.includes("[")) {
+    const cur = getByPath(payload, v);
     if (cur != null && String(cur).includes("@")) return String(cur).trim();
   }
   if (v.includes("@")) return v;
@@ -79,9 +98,11 @@ function clone(o) {
   try { return JSON.parse(JSON.stringify(o ?? {})); } catch { return {}; }
 }
 function interp(str, vars) {
-  return String(str == null ? "" : str).replace(/\{\{\s*([\w.]+)\s*\}\}/g, (_, k) =>
-    vars?.[k] != null ? String(vars[k]) : "",
-  );
+  // Supports {{email}}, {{data.email}} and {{data.source[0]}} placeholders.
+  return String(str == null ? "" : str).replace(/\{\{\s*([\w.[\]]+)\s*\}\}/g, (_, k) => {
+    const v = getByPath(vars, k);
+    return v != null ? String(v) : "";
+  });
 }
 function stepOf(node, status, input, output, message) {
   return { nodeId: node.id, type: node.type, title: node.title || node.type, status, input, output, message };
@@ -89,7 +110,7 @@ function stepOf(node, status, input, output, message) {
 
 function evalCondition(node, payload) {
   const c = node.config || {};
-  const actual = payload?.[c.field];
+  const actual = getByPath(payload, c.field);
   switch (c.op) {
     case "not equals": return String(actual) !== String(c.value);
     case "contains":   return String(actual ?? "").includes(String(c.value ?? ""));
@@ -135,7 +156,9 @@ async function runNode(node, payload, ctx = {}) {
     const next = clone(payload);
     const applied = [];
     for (const m of c.mappings || []) {
-      if (m.from && m.to) { next[m.to] = payload?.[m.from]; applied.push(`${m.from} → ${m.to}`); }
+      // `from` supports nested/array paths ("data.email", "data.source[0]");
+      // `to` is the flat key downstream nodes (Create contact, Send email) read.
+      if (m.from && m.to) { next[m.to] = getByPath(payload, m.from); applied.push(`${m.from} → ${m.to}`); }
     }
     return { payload: next, step: stepOf(node, "ok", input, next, applied.length ? `Mapped ${applied.join(", ")}` : "No field mappings set") };
   }
