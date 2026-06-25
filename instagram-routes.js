@@ -306,9 +306,61 @@ router.put("/settings", requireIg, async (req, res, next) => {
 
 // ---------- Inbox (DMs) ----------
 const IG_CONVO_FIELDS = "id,updated_time,participants{id,username,name},messages.limit(1){id,message,from{id,username},created_time}";
-const IG_MESSAGE_FIELDS = "messages{id,created_time,from{id,username},message}";
+// Rich fields pull attachments (images/videos/audio), shared posts and stories.
+// Falls back to basic text-only if the host rejects the richer field set.
+const IG_MESSAGE_FIELDS_RICH = "messages{id,created_time,from{id,username},message,attachments{id,mime_type,name,image_data,video_data,file_url},shares{data{link,name}},story,is_unsupported}";
+const IG_MESSAGE_FIELDS_BASIC = "messages{id,created_time,from{id,username},message}";
+
+function extractAttachments(m) {
+  const out = [];
+  // Tolerate both Messenger and Instagram shapes (attachments.data[] or attachments[]).
+  const atts = Array.isArray(m.attachments?.data) ? m.attachments.data
+    : Array.isArray(m.attachments) ? m.attachments : [];
+  for (const a of atts) {
+    const mime = a.mime_type || a.type || "";
+    const img = a.image_data?.url || a.image_data?.preview_url;
+    const vid = a.video_data?.url;
+    const payloadUrl = a.payload?.url || a.url || a.file_url || "";
+    if (img || /image|photo/i.test(mime)) {
+      out.push({ type: "image", url: img || payloadUrl, previewUrl: a.image_data?.preview_url || img || payloadUrl, name: a.name || "" });
+    } else if (vid || /video|reel/i.test(mime)) {
+      out.push({ type: "video", url: vid || payloadUrl, previewUrl: a.video_data?.preview_url || "", name: a.name || "" });
+    } else if (/audio|voice/i.test(mime)) {
+      out.push({ type: "audio", url: payloadUrl, name: a.name || "" });
+    } else if (payloadUrl) {
+      out.push({ type: "file", url: payloadUrl, name: a.name || "Attachment" });
+    }
+  }
+  for (const s of m.shares?.data || []) {
+    out.push({ type: "share", url: s.link || "", name: s.name || "Shared post" });
+  }
+  if (m.story) {
+    const link = m.story?.link || m.story?.mention?.link || m.story?.reply_to?.link || "";
+    out.push({ type: "story", url: link, name: "Story" });
+  }
+  // Instagram marks media/reactions it won't return content for as is_unsupported.
+  if (!out.length && !(m.message || "").trim() && m.is_unsupported) {
+    out.push({ type: "unsupported", url: "", name: "" });
+  }
+  return out;
+}
+
+// Base host + account path for the Messaging endpoints. Instagram-Login (oauth)
+// accounts MUST use graph.instagram.com with their IG token — graph.facebook.com
+// can't parse an Instagram token ("Cannot parse access token").
+function inboxBase(ig) {
+  return useIgGraphHost(ig) ? IG_GRAPH_BASE : FB_GRAPH_BASE;
+}
+function inboxAccountPath(ig) {
+  return useIgGraphHost(ig) ? "me" : ig.igAccountId;
+}
 
 async function inboxAccessTokens(ig, req) {
+  // Instagram-Login token only works on graph.instagram.com.
+  if (useIgGraphHost(ig)) {
+    return ig.pageAccessToken ? [ig.pageAccessToken] : [];
+  }
+  // Facebook-Page auth → use the linked Page token(s) on graph.facebook.com.
   const out = [];
   const pageToken = await resolveFacebookPageTokenForIg(ig, req);
   if (pageToken) out.push(pageToken);
@@ -316,11 +368,22 @@ async function inboxAccessTokens(ig, req) {
   return out;
 }
 
-function mapMetaConversation(c, igAccountId) {
+// True when a participant/sender is the connected business account itself.
+// graph.instagram.com returns Instagram-scoped IDs that don't equal igAccountId,
+// so we also match on username.
+function isSelfParticipant(p, igAccountId, selfUsername) {
+  if (!p) return false;
+  if (igAccountId && p.id === igAccountId) return true;
+  const u = (p.username || "").replace(/^@/, "").toLowerCase();
+  const self = (selfUsername || "").replace(/^@/, "").toLowerCase();
+  return !!self && u === self;
+}
+
+function mapMetaConversation(c, igAccountId, selfUsername = "") {
   const participants = c.participants?.data || [];
-  const other = participants.find((p) => p.id && p.id !== igAccountId) || participants[0] || {};
+  const other = participants.find((p) => !isSelfParticipant(p, igAccountId, selfUsername))
+    || participants[0] || {};
   const last = c.messages?.data?.[0];
-  const fromId = last?.from?.id || "";
   return {
     id: c.id,
     igUserId: other.id || "",
@@ -332,9 +395,9 @@ function mapMetaConversation(c, igAccountId) {
   };
 }
 
-function mapMetaMessage(m, igAccountId, conversationId, peer = {}) {
+function mapMetaMessage(m, igAccountId, conversationId, peer = {}, selfUsername = "") {
+  const isOut = isSelfParticipant(m.from, igAccountId, selfUsername);
   const fromId = m.from?.id || "";
-  const isOut = fromId === igAccountId;
   return {
     metaMessageId: m.id || "",
     conversationId,
@@ -342,6 +405,7 @@ function mapMetaMessage(m, igAccountId, conversationId, peer = {}) {
     igUsername: isOut ? (peer.igUsername || "") : (m.from?.username || peer.igUsername || ""),
     direction: isOut ? "out" : "in",
     text: m.message || "",
+    attachments: extractAttachments(m),
     createdAt: m.created_time ? new Date(m.created_time) : new Date(),
     read: isOut,
   };
@@ -352,16 +416,17 @@ async function fetchMetaConversations(ig, req) {
   const igId = ig.igAccountId;
   if (!igId) return { list: [], error: null };
 
+  const url = `${inboxBase(ig)}/${inboxAccountPath(ig)}/conversations`;
   let lastError = null;
   for (const token of tokens) {
     try {
       const data = await fb({
         method: "get",
-        url: `${FB_GRAPH_BASE}/${igId}/conversations`,
+        url,
         params: { platform: "instagram", fields: IG_CONVO_FIELDS, limit: "50" },
         token,
       });
-      return { list: (data?.data || []).map((c) => mapMetaConversation(c, igId)), error: null };
+      return { list: (data?.data || []).map((c) => mapMetaConversation(c, igId, ig.username)), error: null };
     } catch (e) {
       lastError = e.message;
     }
@@ -376,15 +441,29 @@ async function syncMetaMessagesToDb(ig, req, conversationId, peer = {}) {
 
   for (const token of tokens) {
     try {
-      const data = await fb({
-        method: "get",
-        url: `${FB_GRAPH_BASE}/${conversationId}`,
-        params: { fields: IG_MESSAGE_FIELDS, limit: "100" },
-        token,
-      });
+      let data;
+      try {
+        data = await fb({
+          method: "get",
+          url: `${inboxBase(ig)}/${conversationId}`,
+          params: { fields: IG_MESSAGE_FIELDS_RICH, limit: "100" },
+          token,
+        });
+        console.log("[instagram] messages RICH ok");
+      } catch (e) {
+        // Host rejected the rich field set — retry text-only.
+        console.warn("[instagram] messages RICH failed, falling back to basic:", e.message);
+        data = await fb({
+          method: "get",
+          url: `${inboxBase(ig)}/${conversationId}`,
+          params: { fields: IG_MESSAGE_FIELDS_BASIC, limit: "100" },
+          token,
+        });
+      }
       const raw = (data?.messages?.data || []).slice().reverse();
+      console.log("[instagram] raw messages sample:", JSON.stringify((data?.messages?.data || []).slice(0, 3), null, 2));
       for (const m of raw) {
-        const doc = mapMetaMessage(m, ig.igAccountId, conversationId, peer);
+        const doc = mapMetaMessage(m, ig.igAccountId, conversationId, peer, ig.username);
         if (!doc.metaMessageId) continue;
         await InstagramMessage.findOneAndUpdate(
           { user: userId, metaMessageId: doc.metaMessageId },
@@ -494,6 +573,9 @@ router.get("/conversations/:id/messages", requireIg, async (req, res, next) => {
         id: m._id.toString(),
         direction: m.direction,
         text: m.text,
+        attachments: (m.attachments || []).map((a) => ({
+          type: a.type, url: a.url, previewUrl: a.previewUrl, name: a.name,
+        })),
         createdAt: m.createdAt,
         read: m.read,
       })),
@@ -513,22 +595,37 @@ router.post("/conversations/:id/messages", requireIg, async (req, res, next) => 
     let metaMessageId = "";
     let sendError = null;
 
-    for (const token of tokens) {
-      try {
-        const sent = await fb({
-          method: "post",
-          url: `${FB_GRAPH_BASE}/${req.ig.igAccountId}/messages`,
-          data: {
-            recipient: { id: recipientId },
-            message: { text: text.trim() },
-          },
-          token,
-        });
-        metaMessageId = sent?.message_id || sent?.id || "";
-        sendError = null;
-        break;
-      } catch (e) {
-        sendError = e.message;
+    const sendUrl = `${inboxBase(req.ig)}/${inboxAccountPath(req.ig)}/messages`;
+    console.log(`[instagram] send DM → url=${sendUrl} recipient=${recipientId} (igUserId=${igUserId || "none"}) tokens=${tokens.length}`);
+
+    if (!tokens.length) {
+      sendError = "No valid Instagram access token. Reconnect the account in Settings.";
+    } else if (!igUserId) {
+      // conversationId is NOT a valid recipient id — we need the user's IGSID.
+      sendError = "Can't determine the recipient. Open the conversation again (Refresh) so the user id loads, then retry.";
+    } else {
+      for (const token of tokens) {
+        try {
+          const sent = await fb({
+            method: "post",
+            url: sendUrl,
+            data: { recipient: { id: recipientId }, message: { text: text.trim() } },
+            token,
+          });
+          metaMessageId = sent?.message_id || sent?.id || "";
+          sendError = null;
+          break;
+        } catch (e) {
+          const code = e.fb?.code;
+          const sub = e.fb?.error_subcode;
+          console.warn(`[instagram] send DM failed: ${e.message} (code=${code} subcode=${sub})`);
+          // Friendlier message for the common 24-hour-window restriction.
+          if (code === 10 || sub === 2534022 || /outside.*window|24 hours|isn't available/i.test(e.message)) {
+            sendError = "Instagram only allows replies within 24 hours of the user's last message. This conversation is outside that window.";
+          } else {
+            sendError = e.message;
+          }
+        }
       }
     }
 
@@ -964,17 +1061,55 @@ router.get("/media", requireIg, async (req, res, next) => {
 // ---------- Comments ----------
 router.get("/comments", requireIg, async (req, res, next) => {
   try {
-    let comments = await InstagramComment.find({ user: req.user._id }).sort({ createdAt: -1 }).limit(50);
+    // Remove legacy seeded demo comments (fake media_1/media_2 ids) left over
+    // from before this endpoint fetched live data.
+    await InstagramComment.deleteMany({
+      user: req.user._id,
+      commentId: { $in: ["c1", "c2", "c3"] },
+    });
 
-    if (comments.length === 0) {
-      const demos = [
-        { commentId: "c1", igUsername: "style_hub", text: "Price please?", mediaId: "media_1", replied: false },
-        { commentId: "c2", igUsername: "tech_india", text: "This looks amazing!", mediaId: "media_1", replied: true, replyText: "Thank you! 🙏" },
-        { commentId: "c3", igUsername: "delhi_deals", text: "Link in bio?", mediaId: "media_2", replied: false },
-      ];
-      await InstagramComment.insertMany(demos.map((d) => ({ ...d, user: req.user._id })));
-      comments = await InstagramComment.find({ user: req.user._id }).sort({ createdAt: -1 });
+    // Pull live comments from the user's recent posts via the Graph API and
+    // upsert them, preserving any reply state we've already recorded locally.
+    try {
+      const token = await userMetaToken(req);
+      const accessToken = req.ig.pageAccessToken || token;
+      const mediaRes = await fetchIgMedia(req.ig, token, { limit: 25 });
+      const media = (mediaRes?.data || [])
+        .filter((m) => (m.comments_count ?? 0) > 0)
+        .slice(0, 8);
+
+      // Fetch comments for all posts in parallel, then bulk-upsert — keeps the
+      // request fast even when several posts have comments.
+      const perMedia = await Promise.all(
+        media.map((m) =>
+          fetchMediaComments(req.ig, req, m.id, accessToken)
+            .then((r) => ({ mediaId: m.id, items: r.items || [] }))
+            .catch(() => ({ mediaId: m.id, items: [] }))
+        )
+      );
+
+      const ops = [];
+      for (const { mediaId, items } of perMedia) {
+        for (const c of items) {
+          if (!c.id) continue;
+          ops.push({
+            updateOne: {
+              filter: { user: req.user._id, commentId: c.id },
+              update: {
+                $set: { mediaId, igUsername: c.username || "", text: c.text || "" },
+                $setOnInsert: { replied: false, replyText: "" },
+              },
+              upsert: true,
+            },
+          });
+        }
+      }
+      if (ops.length) await InstagramComment.bulkWrite(ops, { ordered: false });
+    } catch (e) {
+      console.warn("[instagram] comments sync:", e.message);
     }
+
+    const comments = await InstagramComment.find({ user: req.user._id }).sort({ createdAt: -1 }).limit(100);
 
     res.json({
       comments: comments.map((c) => ({
@@ -1001,12 +1136,13 @@ router.post("/comments/:id/reply", requireIg, async (req, res, next) => {
 
     try {
       const token = req.ig.pageAccessToken;
-      await fb({
+      const r = await fb({
         method: "post",
         url: `${FB_GRAPH_BASE}/${comment.commentId}/replies`,
         data: { message: text.trim() },
         token,
       });
+      if (r?.id) comment.replyCommentId = r.id;
     } catch (e) {
       console.warn("[instagram] comment reply:", e.message);
     }
@@ -1016,6 +1152,33 @@ router.post("/comments/:id/reply", requireIg, async (req, res, next) => {
     await comment.save();
 
     res.json({ comment: { id: comment._id.toString(), replied: true, replyText: comment.replyText } });
+  } catch (err) { next(err); }
+});
+
+// Delete a reply we posted — removes it on Instagram (if known) and clears local state.
+router.delete("/comments/:id/reply", requireIg, async (req, res, next) => {
+  try {
+    const comment = await InstagramComment.findOne({ _id: req.params.id, user: req.user._id });
+    if (!comment) return res.status(404).json({ error: "Comment not found" });
+
+    if (comment.replyCommentId) {
+      try {
+        await fb({
+          method: "delete",
+          url: `${FB_GRAPH_BASE}/${comment.replyCommentId}`,
+          token: req.ig.pageAccessToken,
+        });
+      } catch (e) {
+        console.warn("[instagram] delete reply:", e.message);
+      }
+    }
+
+    comment.replied = false;
+    comment.replyText = "";
+    comment.replyCommentId = "";
+    await comment.save();
+
+    res.json({ comment: { id: comment._id.toString(), replied: false, replyText: "" } });
   } catch (err) { next(err); }
 });
 
@@ -1037,10 +1200,10 @@ router.get("/flows/:id", requireIg, async (req, res, next) => {
 
 router.post("/flows", requireIg, async (req, res, next) => {
   try {
-    const { name, nodes = [], edges = [], status = "draft", trigger = "dm.received" } = req.body || {};
+    const { name, nodes = [], edges = [], status = "draft", trigger = "dm.received", triggerConfig = {} } = req.body || {};
     if (!name) return res.status(400).json({ error: "name required" });
     const flow = await InstagramFlow.create({
-      user: req.user._id, name, nodes, edges, status, trigger,
+      user: req.user._id, name, nodes, edges, status, trigger, triggerConfig,
     });
     res.status(201).json({ flow: flow.toJSON() });
   } catch (err) { next(err); }
@@ -1064,6 +1227,17 @@ router.delete("/flows/:id", requireIg, async (req, res, next) => {
     const r = await InstagramFlow.deleteOne({ _id: req.params.id, user: req.user._id });
     if (!r.deletedCount) return res.status(404).json({ error: "Flow not found" });
     res.json({ deleted: req.params.id });
+  } catch (err) { next(err); }
+});
+
+// Dry-run a flow against a sample comment — verifies matching + shows messages.
+const { simulateCommentFlow } = require("./webhooks/instagram");
+router.post("/flows/:id/test", requireIg, async (req, res, next) => {
+  try {
+    const flow = await InstagramFlow.findOne({ _id: req.params.id, user: req.user._id });
+    if (!flow) return res.status(404).json({ error: "Flow not found" });
+    const { text = "", mediaId = "", username = "tester" } = req.body || {};
+    res.json(simulateCommentFlow(flow, { text, mediaId, username }));
   } catch (err) { next(err); }
 });
 

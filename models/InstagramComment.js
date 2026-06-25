@@ -10,6 +10,7 @@ const schema = new mongoose.Schema(
     text:          { type: String, default: "" },
     replied:       { type: Boolean, default: false },
     replyText:     { type: String, default: "" },
+    replyCommentId:{ type: String, default: "" },
   },
   { timestamps: true }
 );

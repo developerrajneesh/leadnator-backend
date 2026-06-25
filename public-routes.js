@@ -11,6 +11,9 @@ const GoogleAccount = require("./models/GoogleAccount");
 const EmailCampaign = require("./models/EmailCampaign");
 const EmailConfig   = require("./models/EmailConfig");
 const EmailMessage  = require("./models/EmailMessage");
+const Form          = require("./models/Form");
+const Autopilot     = require("./models/Autopilot");
+const { runAutopilot } = require("./services/autopilotRunner");
 const { parseEmail } = require("./services/mimeParse");
 const { emitToUser } = require("./services/socket");
 const googleSvc    = require("./services/google");
@@ -302,6 +305,98 @@ router.post("/booking/:bookingTypeId", async (req, res, next) => {
       </div>`);
 
     res.status(201).json({ booking, bookingType: bt.toJSON(), meetLink });
+  } catch (err) { next(err); }
+});
+
+// ---------- Public form (view + submit) ----------
+// Used by the /form/:formId page and iframe embeds. No auth — anyone can fill it.
+router.get("/form/:formId", async (req, res, next) => {
+  try {
+    const form = await Form.findOne({ formId: req.params.formId });
+    if (!form) return res.status(404).json({ error: "Form not found" });
+    res.json({
+      form: {
+        formId: form.formId,
+        title: form.title,
+        description: form.description,
+        submitLabel: form.submitLabel,
+        style: form.style || {},
+        fields: form.fields,
+      },
+    });
+  } catch (err) { next(err); }
+});
+
+// Build a friendly, automation-ready payload from raw {fieldId: value} answers:
+// label-slug keys plus auto-detected email / phone / name so downstream actions
+// (send email, create contact) work without manual field mapping.
+function buildSubmissionPayload(form, values) {
+  const payload = { _formId: form.formId, _formTitle: form.title };
+  for (const f of form.fields || []) {
+    const val = values[f.id];
+    const slug = String(f.label || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || f.id;
+    payload[slug] = val;
+    if (f.type === "email" && val && !payload.email) payload.email = val;
+    if (f.type === "phone" && val && !payload.phone) payload.phone = val;
+    if (f.type === "text" && /name/i.test(f.label || "") && val && !payload.name) payload.name = val;
+  }
+  return payload;
+}
+
+// Fire any active "Form submitted" autopilots owned by the form's user/org,
+// matching either this specific form or "Any form" (blank formId).
+async function triggerFormAutopilots(form, values) {
+  const or = [];
+  if (form.organization) or.push({ organization: form.organization });
+  if (form.user) or.push({ createdBy: form.user });
+  if (!or.length) return;
+
+  const aps = await Autopilot.find({ status: "active", $or: or });
+  const body = buildSubmissionPayload(form, values);
+
+  for (const ap of aps) {
+    const trig = ap.config?.trigger;
+    if (!trig || trig.type !== "trigger.form_submitted") continue;
+    const wantFormId = trig.config?.formId;
+    if (wantFormId && wantFormId !== form.formId) continue;
+
+    const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const entry = { runId, ts: new Date(), method: "FORM", headers: {}, query: {}, body, steps: [] };
+    ap.calls = [entry, ...(ap.calls || [])].slice(0, 50);
+    ap.callCount = (ap.callCount || 0) + 1;
+    ap.lastCalledAt = entry.ts;
+    await ap.save();
+
+    const persist = async (steps) => {
+      try { await Autopilot.updateOne({ _id: ap._id, "calls.runId": runId }, { $set: { "calls.$.steps": steps } }); } catch {}
+    };
+    try {
+      const result = await runAutopilot(ap, { body }, persist);
+      await persist(result.steps);
+      console.log(`[form→autopilot] ${ap._id} ran for form ${form.formId} — ${result.steps.length} node(s)`);
+    } catch (e) {
+      console.warn(`[form→autopilot] run failed for ${ap._id}: ${e.message}`);
+    }
+  }
+}
+
+router.post("/form/:formId/submit", async (req, res, next) => {
+  try {
+    const { values } = req.body || {};
+    if (!values || typeof values !== "object") {
+      return res.status(400).json({ error: "values required" });
+    }
+    const form = await Form.findOne({ formId: req.params.formId });
+    if (!form) return res.status(404).json({ error: "Form not found" });
+
+    form.submissions.push({ values, at: new Date() });
+    await form.save();
+
+    try { emitToUser(form.user, "form.submission", { formId: form.formId, title: form.title, values }); } catch {}
+    res.status(201).json({ ok: true });
+
+    // Fire matching autopilots after responding (don't block the submitter).
+    triggerFormAutopilots(form, values).catch((e) => console.warn("[form→autopilot]", e.message));
   } catch (err) { next(err); }
 });
 

@@ -279,6 +279,7 @@ app.get("/api/auth/me", authRequired, (req, res) => {
 
 app.use("/api/orgs", authRequired, orgRoutes);
 app.use("/api/autopilot", authRequired, autopilotRoutes);
+app.use("/api/forms", authRequired, require("./forms-routes"));
 
 // ---------- PASSWORD RESET ----------
 // Step 1: user submits their email → we generate a one-time token, stash it on

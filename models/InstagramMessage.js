@@ -8,6 +8,16 @@ const schema = new mongoose.Schema(
     igUsername:     { type: String, default: "" },
     direction:      { type: String, enum: ["in", "out"], default: "in" },
     text:           { type: String, default: "" },
+    attachments:    {
+      type: [{
+        _id:        false,
+        type:       { type: String, default: "file" }, // image | video | audio | file | share | story
+        url:        { type: String, default: "" },
+        previewUrl: { type: String, default: "" },
+        name:       { type: String, default: "" },
+      }],
+      default: [],
+    },
     metaMessageId:  { type: String, default: "", sparse: true },
     read:           { type: Boolean, default: false },
   },

@@ -28,6 +28,7 @@ const schema = new mongoose.Schema(
     name:   { type: String, required: true, trim: true },
     status: { type: String, enum: ["draft", "active", "paused"], default: "draft" },
     trigger: { type: String, enum: ["dm.received", "comment.new", "story.mention", "keyword.dm"], default: "dm.received" },
+    triggerConfig: { type: mongoose.Schema.Types.Mixed, default: {} },
     nodes:  [nodeSchema],
     edges:  [edgeSchema],
     runs:   { type: Number, default: 0 },
