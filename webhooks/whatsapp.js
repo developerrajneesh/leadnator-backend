@@ -393,8 +393,9 @@ async function tryChatbotReply({ conn, fromPhone, text, buttonId = "", messageId
   }
   if (!bot) { log("no active chatbot for this number — skipping auto-reply"); return; }
 
-  // Show "seen" + "typing…" before the bot replies.
-  await markReadAndTyping(conn, messageId);
+  // Show "seen" + "typing…" before the bot replies (fire-and-forget so it can
+  // never block or affect the actual reply).
+  markReadAndTyping(conn, messageId).catch(() => {});
 
   // AI chatbot: answer from the knowledge base instead of running keyword steps.
   if (bot.type === "ai") {

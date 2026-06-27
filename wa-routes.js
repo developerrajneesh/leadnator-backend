@@ -51,6 +51,24 @@ async function fb({ method, url, params, data, token }) {
   throw e;
 }
 
+// Turn common WhatsApp Cloud API send errors into clear, actionable messages.
+function friendlyWaSendError(err) {
+  const code = err?.fb?.code;
+  if (code === 131037) {
+    return "Your WhatsApp number's display name isn't approved for sending yet. Open Meta WhatsApp Manager → Phone numbers → your number → set/submit the display name for approval, then try again.";
+  }
+  if (code === 131047 || code === 131051) {
+    return "This chat is outside WhatsApp's 24-hour window. You can only send an approved message template (not free text) until the customer messages you again.";
+  }
+  if (code === 131026) {
+    return "Message undeliverable — the recipient may not have WhatsApp or has blocked your number.";
+  }
+  if (code === 131056 || code === 368) {
+    return "Sending is temporarily rate-limited or restricted on this number. Wait a bit and try again.";
+  }
+  return null;
+}
+
 function defaultRegisterPin() {
   return String(process.env.WHATSAPP_REGISTER_PIN || "000000").trim() || "000000";
 }
@@ -720,6 +738,78 @@ router.get("/account-info", requireWa, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ---------- ADD PHONE NUMBER (raw Graph API: add → OTP → verify → register) ----------
+// Step 1 — register the number on the WABA. Returns the new phone_number id.
+router.post("/phone-numbers", requireWa, async (req, res, next) => {
+  try {
+    const wabaId = req.wa.businessAccountId;
+    if (!wabaId) return res.status(400).json({ error: "No WhatsApp Business Account (WABA) linked. Reconnect with WABA ID first." });
+    const { cc, phoneNumber, verifiedName } = req.body || {};
+    if (!cc || !phoneNumber || !verifiedName) {
+      return res.status(400).json({ error: "Country code, phone number and display name are all required." });
+    }
+    const out = await fb({
+      method: "post",
+      url: `${FB_GRAPH_BASE}/${wabaId}/phone_numbers`,
+      data: {
+        cc: String(cc).replace(/\D/g, ""),
+        phone_number: String(phoneNumber).replace(/\D/g, ""),
+        verified_name: String(verifiedName).trim(),
+      },
+      token: req.wa.accessToken,
+    });
+    res.json({ id: out?.id || "", raw: out });
+  } catch (err) {
+    const friendly = friendlyWaSendError(err);
+    if (friendly) return res.status(400).json({ error: friendly, code: err?.fb?.code });
+    next(err);
+  }
+});
+
+// Step 2 — request a verification code (SMS or VOICE) on the new number.
+router.post("/phone-numbers/:id/request-code", requireWa, async (req, res, next) => {
+  try {
+    const { method = "SMS", language = "en_US" } = req.body || {};
+    const out = await fb({
+      method: "post",
+      url: `${FB_GRAPH_BASE}/${req.params.id}/request_code`,
+      data: { code_method: method === "VOICE" ? "VOICE" : "SMS", language },
+      token: req.wa.accessToken,
+    });
+    res.json({ ok: true, raw: out });
+  } catch (err) { next(err); }
+});
+
+// Step 3 — verify the code the number received.
+router.post("/phone-numbers/:id/verify-code", requireWa, async (req, res, next) => {
+  try {
+    const { code } = req.body || {};
+    if (!code) return res.status(400).json({ error: "Verification code is required." });
+    const out = await fb({
+      method: "post",
+      url: `${FB_GRAPH_BASE}/${req.params.id}/verify_code`,
+      data: { code: String(code).replace(/\D/g, "") },
+      token: req.wa.accessToken,
+    });
+    res.json({ ok: true, raw: out });
+  } catch (err) { next(err); }
+});
+
+// Step 4 — register the number for Cloud API with a 6-digit two-step PIN.
+router.post("/phone-numbers/:id/register", requireWa, async (req, res, next) => {
+  try {
+    const { pin } = req.body || {};
+    if (!/^\d{6}$/.test(String(pin || ""))) return res.status(400).json({ error: "A 6-digit PIN is required." });
+    const out = await fb({
+      method: "post",
+      url: `${FB_GRAPH_BASE}/${req.params.id}/register`,
+      data: { messaging_product: "whatsapp", pin: String(pin) },
+      token: req.wa.accessToken,
+    });
+    res.json({ ok: true, raw: out });
+  } catch (err) { next(err); }
+});
+
 // ---------- TEMPLATES ----------
 router.get("/templates", requireWa, async (req, res, next) => {
   try {
@@ -898,16 +988,13 @@ router.post("/conversations/:phone/read", async (req, res, next) => {
     const { phoneNumberId } = scope;
     const phone = req.params.phone;
 
+    // Match the unique index (user, phone) so we update an existing contact even
+    // if it was created under a different phoneNumberId — avoids E11000 dup-key.
     await WhatsAppContact.updateOne(
-      contactScope(req.user._id, phoneNumberId, phone),
+      { user: req.user._id, phone },
       {
-        $setOnInsert: {
-          user: req.user._id,
-          phoneNumberId,
-          phone,
-          name: phone,
-        },
-        $set: { lastReadAt: new Date() },
+        $setOnInsert: { name: phone },
+        $set: { lastReadAt: new Date(), phoneNumberId },
       },
       { upsert: true }
     );
@@ -1559,7 +1646,11 @@ router.post("/conversations/:phone/reply", requireWa, async (req, res, next) => 
     });
     emitToUser(req.user._id, "wa.outbound", { message: msg.toJSON() });
     res.json({ message: msg, messageId });
-  } catch (err) { next(err); }
+  } catch (err) {
+    const friendly = friendlyWaSendError(err);
+    if (friendly) return res.status(400).json({ error: friendly, code: err?.fb?.code });
+    next(err);
+  }
 });
 
 // Send a media message (image/video/audio/document) to a conversation. The
