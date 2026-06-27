@@ -5,7 +5,8 @@ const mongoose = require("mongoose");
 // JSON responses. The user must explicitly opt in via the Storage settings UI.
 const schema = new mongoose.Schema(
   {
-    user:            { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, unique: true, index: true },
+    user:            { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    organization:    { type: mongoose.Schema.Types.ObjectId, ref: "Organization", index: true },
     endpointUrl:     { type: String, default: "" },
     accessKeyId:     { type: String, default: "", select: false },
     secretAccessKey: { type: String, default: "", select: false },
@@ -31,5 +32,10 @@ const schema = new mongoose.Schema(
     },
   }
 );
+
+// One storage config per (user, organization) — each workspace connects its
+// own bucket. (Older DBs may carry a stale unique index on `user` alone; drop
+// it with scripts/backfill-storage-org.js.)
+schema.index({ user: 1, organization: 1 }, { unique: true });
 
 module.exports = mongoose.models.StorageConfig || mongoose.model("StorageConfig", schema);

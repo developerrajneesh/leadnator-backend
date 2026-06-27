@@ -94,8 +94,11 @@ function clientForAccount(account) {
   return client;
 }
 
-function getAccountForUser(userId) {
-  return GoogleAccount.findOne({ user: userId }).select("+accessToken +refreshToken");
+// Google connection is per (user, organization). Pass the org so each workspace
+// uses its OWN connected Google account.
+function getAccountForUser(userId, orgId = null) {
+  return GoogleAccount.findOne({ user: userId, organization: orgId || null })
+    .select("+accessToken +refreshToken");
 }
 
 // Create a calendar event with a Google Meet link and invite the attendee.

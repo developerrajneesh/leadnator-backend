@@ -2,7 +2,8 @@ const mongoose = require("mongoose");
 
 const schema = new mongoose.Schema(
   {
-    user:       { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    user:         { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: "Organization", index: true },
     name:       { type: String, required: true, trim: true },
     type:       { type: String, enum: ["folder", "file"], required: true },
     parentPath: { type: String, default: "/", index: true },   // e.g. "/" or "/Documents/Contracts"
@@ -29,6 +30,6 @@ const schema = new mongoose.Schema(
   }
 );
 
-schema.index({ user: 1, parentPath: 1, deleted: 1 });
+schema.index({ user: 1, organization: 1, parentPath: 1, deleted: 1 });
 
 module.exports = mongoose.models.StorageItem || mongoose.model("StorageItem", schema);

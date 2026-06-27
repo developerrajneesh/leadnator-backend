@@ -2,7 +2,8 @@ const mongoose = require("mongoose");
 
 const schema = new mongoose.Schema(
   {
-    user:    { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    user:         { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: "Organization", index: true },
     name:    { type: String, default: "" },
     email:   { type: String, required: true, lowercase: true, trim: true },
     tags:    [{ type: String }],
@@ -23,6 +24,8 @@ const schema = new mongoose.Schema(
   }
 );
 
-schema.index({ user: 1, email: 1 }, { unique: true });
+// Unique per (user, organization, email) so the same contact can exist
+// independently in each of a user's organizations.
+schema.index({ user: 1, organization: 1, email: 1 }, { unique: true });
 
 module.exports = mongoose.models.EmailSubscriber || mongoose.model("EmailSubscriber", schema);

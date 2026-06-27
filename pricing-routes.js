@@ -142,8 +142,14 @@ router.post("/verify", async (req, res, next) => {
     sub.expiresAt = expiresAt;
     await sub.save();
 
-    // Reflect plan on the user doc
-    await User.findByIdAndUpdate(req.user._id, { plan: sub.planName });
+    // Reflect plan on the user doc (denormalized for fast enforcement) and end
+    // any free trial now that they're a paying customer.
+    await User.findByIdAndUpdate(req.user._id, {
+      plan: sub.planName,
+      planKey: sub.planKey,
+      subscriptionActive: true,
+      trialEndsAt: null,
+    });
 
     // Create an invoice
     const invoice = await Invoice.create({
@@ -181,6 +187,8 @@ router.post("/cancel", async (req, res, next) => {
     sub.status = "cancelled";
     sub.cancelledAt = new Date();
     await sub.save();
+    // Drop the paid flag so enforcement falls back to Starter/expired.
+    await User.findByIdAndUpdate(req.user._id, { subscriptionActive: false });
     res.json({ subscription: sub.toJSON() });
   } catch (err) { next(err); }
 });

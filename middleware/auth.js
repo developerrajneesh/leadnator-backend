@@ -33,6 +33,9 @@ exports.protect = async (req, res, next) => {
       if (!owner || owner.status === "deleted") {
         return res.status(401).json({ error: "Owner account no longer exists" });
       }
+      if (owner.status === "suspended") {
+        return res.status(403).json({ error: "Your team owner's account has been suspended." });
+      }
       if (owner.status === "paused") {
         return res.status(403).json({ error: "Your team owner's account is paused." });
       }
@@ -44,6 +47,7 @@ exports.protect = async (req, res, next) => {
 
     const user = await User.findById(decoded.id);
     if (!user || user.status === "deleted") return res.status(401).json({ error: "User not found" });
+    if (user.status === "suspended") return res.status(403).json({ error: "Your account has been suspended. Please contact support.", suspended: true });
     if (user.status === "paused") return res.status(403).json({ error: "Account paused" });
 
     req.user = user;

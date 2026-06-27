@@ -5,13 +5,21 @@ const BookingType   = require("./models/BookingType");
 const Booking       = require("./models/Booking");
 const GoogleAccount = require("./models/GoogleAccount");
 const googleSvc     = require("./services/google");
+const { tenantId }  = require("./middleware/tenant");
 
 const router = express.Router();
+
+// Tenant scope for EVERY calendar query/write. A user's events, availability,
+// booking types, bookings and Google connection are isolated PER ORGANIZATION
+// (tenantId = active org id, or the user id when no org is selected).
+function scope(req, extra = {}) {
+  return { user: req.user._id, organization: tenantId(req), ...extra };
+}
 
 // ---------- GOOGLE CALENDAR / MEET (Calendly-style sync) ----------
 router.get("/google/status", async (req, res, next) => {
   try {
-    const acc = await GoogleAccount.findOne({ user: req.user._id });
+    const acc = await GoogleAccount.findOne(scope(req));
     res.json({
       configured: googleSvc.isConfigured(),
       connected: !!acc,
@@ -34,7 +42,7 @@ router.get("/google/connect", (req, res, next) => {
 
 router.post("/google/disconnect", async (req, res, next) => {
   try {
-    await GoogleAccount.deleteOne({ user: req.user._id });
+    await GoogleAccount.deleteOne(scope(req));
     res.json({ ok: true });
   } catch (err) { next(err); }
 });
@@ -43,7 +51,7 @@ router.post("/google/disconnect", async (req, res, next) => {
 router.get("/events", async (req, res, next) => {
   try {
     const { from, to, type } = req.query;
-    const filter = { user: req.user._id };
+    const filter = scope(req);
     if (type && type !== "all") filter.type = type;
     if (from || to) {
       filter.start = {};
@@ -60,7 +68,7 @@ router.post("/events", async (req, res, next) => {
     const { title, type = "meeting", start, end, attendees = [], location = "", notes = "", leadId } = req.body || {};
     if (!title || !start || !end) return res.status(400).json({ error: "title, start, end required" });
     const event = await CalendarEvent.create({
-      user: req.user._id, title, type, start, end, attendees, location, notes,
+      ...scope(req), title, type, start, end, attendees, location, notes,
       leadId: leadId || null,
     });
     res.status(201).json({ event });
@@ -71,7 +79,7 @@ router.put("/events/:id", async (req, res, next) => {
   try {
     const { _id, id, user, ...rest } = req.body || {};
     const event = await CalendarEvent.findOneAndUpdate(
-      { _id: req.params.id, user: req.user._id }, rest, { new: true, runValidators: true }
+      scope(req, { _id: req.params.id }), rest, { new: true, runValidators: true }
     );
     if (!event) return res.status(404).json({ error: "Event not found" });
     res.json({ event });
@@ -80,7 +88,7 @@ router.put("/events/:id", async (req, res, next) => {
 
 router.delete("/events/:id", async (req, res, next) => {
   try {
-    const r = await CalendarEvent.deleteOne({ _id: req.params.id, user: req.user._id });
+    const r = await CalendarEvent.deleteOne(scope(req, { _id: req.params.id }));
     if (!r.deletedCount) return res.status(404).json({ error: "Event not found" });
     res.json({ deleted: req.params.id });
   } catch (err) { next(err); }
@@ -104,8 +112,8 @@ const DEFAULT_AVAIL = {
 
 router.get("/availability", async (req, res, next) => {
   try {
-    let doc = await Availability.findOne({ user: req.user._id });
-    if (!doc) doc = await Availability.create({ user: req.user._id, ...DEFAULT_AVAIL });
+    let doc = await Availability.findOne(scope(req));
+    if (!doc) doc = await Availability.create({ ...scope(req), ...DEFAULT_AVAIL });
     res.json({ availability: doc });
   } catch (err) { next(err); }
 });
@@ -114,7 +122,7 @@ router.put("/availability", async (req, res, next) => {
   try {
     const { _id, id, user, ...rest } = req.body || {};
     const doc = await Availability.findOneAndUpdate(
-      { user: req.user._id }, { ...rest, user: req.user._id },
+      scope(req), { ...rest, ...scope(req) },
       { new: true, upsert: true, setDefaultsOnInsert: true }
     );
     res.json({ availability: doc });
@@ -124,7 +132,7 @@ router.put("/availability", async (req, res, next) => {
 // ---------- BOOKING TYPES ----------
 router.get("/booking-types", async (req, res, next) => {
   try {
-    const types = await BookingType.find({ user: req.user._id }).sort({ createdAt: 1 });
+    const types = await BookingType.find(scope(req)).sort({ createdAt: 1 });
     res.json({ bookingTypes: types });
   } catch (err) { next(err); }
 });
@@ -133,7 +141,7 @@ router.post("/booking-types", async (req, res, next) => {
   try {
     const { name, duration = 30, location = "Google Meet", description = "", color = "#7c3aed", slug = "" } = req.body || {};
     if (!name) return res.status(400).json({ error: "name required" });
-    const bt = await BookingType.create({ user: req.user._id, name, duration, location, description, color, slug });
+    const bt = await BookingType.create({ ...scope(req), name, duration, location, description, color, slug });
     res.status(201).json({ bookingType: bt });
   } catch (err) { next(err); }
 });
@@ -142,7 +150,7 @@ router.put("/booking-types/:id", async (req, res, next) => {
   try {
     const { _id, id, user, ...rest } = req.body || {};
     const bt = await BookingType.findOneAndUpdate(
-      { _id: req.params.id, user: req.user._id }, rest, { new: true, runValidators: true }
+      scope(req, { _id: req.params.id }), rest, { new: true, runValidators: true }
     );
     if (!bt) return res.status(404).json({ error: "Booking type not found" });
     res.json({ bookingType: bt });
@@ -151,7 +159,7 @@ router.put("/booking-types/:id", async (req, res, next) => {
 
 router.delete("/booking-types/:id", async (req, res, next) => {
   try {
-    const r = await BookingType.deleteOne({ _id: req.params.id, user: req.user._id });
+    const r = await BookingType.deleteOne(scope(req, { _id: req.params.id }));
     if (!r.deletedCount) return res.status(404).json({ error: "Booking type not found" });
     res.json({ deleted: req.params.id });
   } catch (err) { next(err); }
@@ -160,7 +168,7 @@ router.delete("/booking-types/:id", async (req, res, next) => {
 // ---------- BOOKINGS (host view) ----------
 router.get("/bookings", async (req, res, next) => {
   try {
-    const list = await Booking.find({ host: req.user._id })
+    const list = await Booking.find({ host: req.user._id, organization: tenantId(req) })
       .populate("bookingType", "name color duration")
       .sort({ slot: -1 });
     res.json({ bookings: list });

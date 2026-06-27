@@ -8,7 +8,13 @@ const userSchema = new mongoose.Schema(
     password: { type: String, required: true, minlength: 6, select: false },
     role:     { type: String, enum: ["user", "admin"], default: "user" },
     plan:     { type: String, enum: ["Starter", "Growth", "Pro"], default: "Starter" },
-    status:   { type: String, enum: ["active", "paused", "deleted"], default: "active" },
+    // Canonical plan key + billing state (denormalized for fast enforcement).
+    // No default on purpose: existing users must fall back to their `plan` name
+    // (a default here would hydrate as "starter" and downgrade them).
+    planKey:            { type: String, enum: ["starter", "growth", "pro", null], default: undefined },
+    subscriptionActive: { type: Boolean, default: false },   // true while a paid sub is active
+    trialEndsAt:        { type: Date, default: null },        // 2-day Starter trial for new signups
+    status:   { type: String, enum: ["active", "paused", "suspended", "deleted"], default: "active" },
     phone:    { type: String, default: "" },
     company:  { type: String, default: "" },
     joinedAt: { type: Date, default: Date.now },

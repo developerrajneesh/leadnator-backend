@@ -8,6 +8,7 @@ const {
   verifyMembership,
   touchMembership,
 } = require("./services/orgService");
+const { accessState } = require("./middleware/plan");
 
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || "dev_secret";
@@ -50,6 +51,19 @@ router.post("/", async (req, res, next) => {
 
     if (!loginEmail || !password) {
       return res.status(400).json({ error: "Workspace login email and password are required" });
+    }
+
+    // Enforce the per-plan workspace limit (Starter 1 · Growth 3 · Pro unlimited).
+    const st = accessState(req.user);
+    if (st.expired) {
+      return res.status(402).json({ error: "Your free trial has ended. Subscribe to add workspaces.", upgrade: true, trialExpired: true });
+    }
+    const wsLimit = st.plan.limits.workspaces;
+    if (isFinite(wsLimit)) {
+      const count = await Organization.countDocuments({ createdBy: req.user._id, status: { $ne: "archived" } });
+      if (count >= wsLimit) {
+        return res.status(402).json({ error: `Your ${st.plan.name} plan allows ${wsLimit} workspace${wsLimit === 1 ? "" : "s"}. Upgrade to add more.`, upgrade: true, limit: wsLimit, current: count });
+      }
     }
 
     const org = await createOrganization(req.user._id, {

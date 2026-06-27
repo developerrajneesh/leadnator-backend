@@ -20,6 +20,7 @@ const Ticket      = require("./models/Ticket");
 const Plan        = require("./models/Plan");
 const TeamMember  = require("./models/TeamMember");
 const { resolveOrganization, leadFilter: orgLeadFilter, tenantId } = require("./middleware/tenant");
+const { checkLeadLimit } = require("./middleware/plan");
 
 function leadFlowScope(req) {
   return { user: req.user._id, organization: tenantId(req) };
@@ -489,7 +490,7 @@ app.get("/api/leads/:id/chat", authRequired, ah(async (req, res) => {
   });
 }));
 
-app.post("/api/leads", authRequired, ah(async (req, res) => {
+app.post("/api/leads", authRequired, checkLeadLimit, ah(async (req, res) => {
   const { name, email, phone = "", source = "Manual", status = "new", tags = [], notes = "", value = 0 } = req.body || {};
   if (!name || !email) return res.status(400).json({ error: "Name and email required" });
   const lead = await Lead.create({
@@ -505,13 +506,15 @@ app.post("/api/leads", authRequired, ah(async (req, res) => {
 // Bulk CSV import. The client parses the CSV and posts { rows: [{name,email,phone,source}] }.
 // We validate, dedupe (by email), respect the plan's lead limit, then bulk-insert.
 app.post("/api/leads/import", authRequired, ah(async (req, res) => {
-  const { PLANS } = require("./config/plans");
+  const { accessState } = require("./middleware/plan");
   const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
   if (!rows.length) return res.status(400).json({ error: "No rows to import" });
 
-  const plan = PLANS[req.user?.plan?.id || "starter"] || {};
+  const state = accessState(req.user);
+  if (state.expired) return res.status(402).json({ error: "Your free trial has ended. Subscribe to import leads.", upgrade: true, trialExpired: true });
+  const leadLimit = state.plan.limits.leads;
   const current = await Lead.countDocuments({ owner: req.user._id });
-  const remaining = isFinite(plan.leadLimit) ? Math.max(0, plan.leadLimit - current) : Infinity;
+  const remaining = isFinite(leadLimit) ? Math.max(0, leadLimit - current) : Infinity;
 
   const existingEmails = new Set(
     (await Lead.find({ owner: req.user._id }).select("email").lean())
@@ -725,8 +728,8 @@ app.get("/api/lead-flows/:id/logs", authRequired, ah(async (req, res) => {
 }));
 
 // ---------- CAMPAIGNS ----------
-app.get("/api/campaigns", authRequired, ah(async (_req, res) => {
-  const campaigns = await Campaign.find().sort({ createdAt: -1 });
+app.get("/api/campaigns", authRequired, ah(async (req, res) => {
+  const campaigns = await Campaign.find({ owner: req.user._id }).sort({ createdAt: -1 });
   res.json({ campaigns });
 }));
 
@@ -798,7 +801,7 @@ app.get("/api/plans", ah(async (_req, res) => {
 // ---------- DASHBOARD STATS ----------
 app.get("/api/dashboard/stats", authRequired, ah(async (req, res) => {
   const filter = orgLeadFilter(req);
-  const [leads, campaigns] = await Promise.all([Lead.find(filter), Campaign.find()]);
+  const [leads, campaigns] = await Promise.all([Lead.find(filter), Campaign.find({ owner: req.user._id })]);
 
   const byStatus = leads.reduce((acc, l) => ((acc[l.status] = (acc[l.status] || 0) + 1), acc), {});
   const bySource = leads.reduce((acc, l) => ((acc[l.source] = (acc[l.source] || 0) + 1), acc), {});
@@ -926,16 +929,23 @@ app.get("/api/dashboard/overview", authRequired, ah(async (req, res) => {
   const EmailCampaign = require("./models/EmailCampaign");
   const WhatsAppMessage = require("./models/WhatsAppMessage");
   const WhatsAppContact = require("./models/WhatsAppContact");
+  const WhatsAppConnection = require("./models/WhatsAppConnection");
   const StorageItem = require("./models/StorageItem");
 
   const lf = orgLeadFilter(req);
+  const scope = leadFlowScope(req); // { user, organization }
+  // WhatsApp data is tagged by the phone number connected to THIS workspace.
+  const waConn = await WhatsAppConnection.findOne({ organization: tenantId(req) }).select("phoneNumberId");
+  const waPhoneId = waConn?.phoneNumberId || null;
+  const waMatch = waPhoneId ? { user: req.user._id, phoneNumberId: waPhoneId } : null;
+
   const [leads, emailCamps, waMessages, waContacts, waCampaigns, storageFiles] = await Promise.all([
     Lead.find(lf).sort({ createdAt: -1 }),
-    EmailCampaign.find({ user: req.user._id }).sort({ createdAt: -1 }),
-    WhatsAppMessage.countDocuments({ user: req.user._id }),
-    WhatsAppContact.countDocuments({ user: req.user._id }),
-    require("./models/WhatsAppCampaign").countDocuments({ user: req.user._id }),
-    StorageItem.countDocuments({ user: req.user._id, type: "file", deleted: false }),
+    EmailCampaign.find(scope).sort({ createdAt: -1 }),
+    waMatch ? WhatsAppMessage.countDocuments(waMatch) : Promise.resolve(0),
+    waMatch ? WhatsAppContact.countDocuments(waMatch) : Promise.resolve(0),
+    waPhoneId ? require("./models/WhatsAppCampaign").countDocuments({ user: req.user._id }) : Promise.resolve(0),
+    StorageItem.countDocuments({ ...scope, type: "file", deleted: false }),
   ]);
 
   // Day-by-day buckets — past 14 days, zero-filled.
@@ -1060,7 +1070,7 @@ app.get("/api/dashboard/export/:kind", authRequired, ah(async (req, res) => {
   }
   if (kind === "campaigns") {
     const EmailCampaign = require("./models/EmailCampaign");
-    const rows = await EmailCampaign.find({ user: req.user._id }).sort({ createdAt: -1 });
+    const rows = await EmailCampaign.find(leadFlowScope(req)).sort({ createdAt: -1 });
     const csv = toCsv(rows, [
       { key: "name" }, { key: "status" }, { key: "sent" }, { key: "opens" }, { key: "clicks" },
       { key: "createdAt", get: (r) => new Date(r.createdAt).toISOString() },
@@ -1074,6 +1084,7 @@ app.get("/api/dashboard/export/:kind", authRequired, ah(async (req, res) => {
 
 // ---------- ADMIN ----------
 app.get("/api/admin/users", authRequired, adminOnly, ah(async (_req, res) => {
+  const Subscription = require("./models/Subscription");
   const users = await User.find({ role: { $ne: "admin" } }).sort({ createdAt: -1 });
 
   // attach lead count per user
@@ -1081,7 +1092,20 @@ app.get("/api/admin/users", authRequired, adminOnly, ah(async (_req, res) => {
     { $group: { _id: "$owner", count: { $sum: 1 } } },
   ]);
   const countMap = counts.reduce((a, c) => ((a[c._id.toString()] = c.count), a), {});
-  const payload = users.map((u) => ({ ...u.toJSON(), leads: countMap[u._id.toString()] || 0 }));
+
+  // attach each user's active subscription (months + expiry) for the admin UI
+  const subs = await Subscription.find({ status: "active" }).sort({ createdAt: -1 });
+  const subMap = {};
+  for (const s of subs) {
+    const k = s.user.toString();
+    if (!subMap[k]) subMap[k] = { months: s.months, expiresAt: s.expiresAt, planName: s.planName, startedAt: s.startedAt };
+  }
+
+  const payload = users.map((u) => ({
+    ...u.toJSON(),
+    leads: countMap[u._id.toString()] || 0,
+    subscription: subMap[u._id.toString()] || null,
+  }));
 
   res.json({ users: payload });
 }));
@@ -1133,10 +1157,49 @@ app.get("/api/admin/notifications", authRequired, adminOnly, ah(async (req, res)
 }));
 
 app.put("/api/admin/users/:id", authRequired, adminOnly, ah(async (req, res) => {
-  const { password, _id, id, ...rest } = req.body || {};
-  const user = await User.findByIdAndUpdate(req.params.id, rest, { new: true, runValidators: true });
+  const { password, _id, id, planMonths, ...rest } = req.body || {};
+  const Subscription = require("./models/Subscription");
+  const { planKeyFromAny } = require("./config/plans");
+
+  const user = await User.findById(req.params.id);
   if (!user) return res.status(404).json({ error: "User not found" });
-  res.json({ user: user.toJSON() });
+
+  // Grant/refresh a paid plan only when the admin actually changes the plan or
+  // its duration — so editing name/status doesn't spawn a new subscription.
+  const newPlanKey = rest.plan ? planKeyFromAny(rest.plan) : null;
+  const months = Math.max(1, Math.min(60, parseInt(planMonths, 10) || 0));
+  const activeSub = await Subscription.findOne({ user: user._id, status: "active" }).sort({ createdAt: -1 });
+  const planChanged   = newPlanKey && newPlanKey !== user.planKey;
+  const monthsChanged = months && activeSub && months !== activeSub.months;
+  const reassigning = planChanged || monthsChanged;
+
+  if (reassigning) {
+    const m = months || 1;
+    const startedAt = new Date();
+    const expiresAt = new Date(startedAt.getTime() + m * 30 * 86400000);
+    const durMap = { 1: "monthly", 3: "quarter", 6: "half", 12: "yearly" };
+    await Subscription.updateMany({ user: user._id, status: "active" }, { $set: { status: "cancelled", cancelledAt: new Date() } });
+    await Subscription.create({
+      user: user._id,
+      planKey: newPlanKey,
+      planName: rest.plan,
+      duration: durMap[m] || "monthly",
+      months: m,
+      amount: 0, // admin-granted
+      status: "active",
+      startedAt, expiresAt,
+    });
+    rest.planKey = newPlanKey;
+    rest.subscriptionActive = true;
+    rest.trialEndsAt = null;
+  }
+
+  Object.assign(user, rest);
+  await user.save();
+
+  // Return the user + its active subscription summary.
+  const sub = await Subscription.findOne({ user: user._id, status: "active" }).sort({ createdAt: -1 });
+  res.json({ user: user.toJSON(), subscription: sub ? sub.toJSON() : null });
 }));
 
 app.delete("/api/admin/users/:id", authRequired, adminOnly, ah(async (req, res) => {

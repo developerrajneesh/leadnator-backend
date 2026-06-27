@@ -4,6 +4,7 @@ const schema = new mongoose.Schema(
   {
     bookingType:  { type: mongoose.Schema.Types.ObjectId, ref: "BookingType", required: true, index: true },
     host:         { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: "Organization", index: true },
     slot:         { type: Date, required: true, index: true },
     duration:     { type: Number, required: true },
     name:         { type: String, required: true, trim: true },

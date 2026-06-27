@@ -65,28 +65,10 @@ async function run() {
     { name: "Mohit Khanna", email: "mohit@cloudplex.io",  password: await hashPassword("demo1234"), role: "user", plan: "Pro",     status: "active" },
   ]);
 
-  // -------- PLANS --------
+  // -------- PLANS (from the single source of truth: config/plans.js) --------
   console.log("Seeding plans…");
-  await Plan.insertMany([
-    {
-      key: "starter", name: "Starter", price: 299, leadLimit: 100,
-      tagline: "Great for solopreneurs starting out.",
-      features: ["Up to 100 leads", "Basic email marketing", "Lead import (CSV)", "Email support"],
-      disabled: ["AI ad copy generation", "Meta Ads integration", "Team access", "API access"],
-    },
-    {
-      key: "growth", name: "Growth", price: 499, leadLimit: 500, popular: true,
-      tagline: "Scale your funnel with AI and paid ads.",
-      features: ["Up to 500 leads", "AI content generation", "Meta Ads integration", "Advanced email automation", "Priority support"],
-      disabled: ["Unlimited API access", "Dedicated account manager"],
-    },
-    {
-      key: "pro", name: "Pro", price: 999, leadLimit: -1,
-      tagline: "Full firepower for growing teams.",
-      features: ["Unlimited leads", "Full AI automation suite", "Meta + Google Ads", "API access & webhooks", "Team seats (up to 10)", "Dedicated account manager"],
-      disabled: [],
-    },
-  ]);
+  const { dbPlanDocs } = require("./config/plans");
+  await Plan.insertMany(dbPlanDocs());
 
   // -------- LEADS (shared between testUser + deepak) --------
   console.log("Seeding leads…");

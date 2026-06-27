@@ -22,6 +22,10 @@ const {
   contactScope,
 } = require("./services/waScope");
 const { ensureWabaSubscribed } = require("./services/waSubscribe");
+const { requireFeature } = require("./middleware/plan");
+
+// WhatsApp marketing is a Growth+ feature (AI chatbot is gated inline as Pro-only).
+const requireWhatsApp = requireFeature("whatsapp", "WhatsApp marketing");
 
 const FB_API_VERSION = process.env.META_API_VERSION || "v23.0";
 const FB_GRAPH_BASE = `https://graph.facebook.com/${FB_API_VERSION}`;
@@ -383,7 +387,7 @@ async function requireWa(req, res, next) {
 }
 
 // ---------- CONNECT / STATUS ----------
-router.post("/connect", async (req, res, next) => {
+router.post("/connect", requireWhatsApp, async (req, res, next) => {
   try {
     const { phoneNumberId, accessToken, businessAccountId = "", webhookVerifyToken = "", pin } = req.body || {};
     if (!phoneNumberId || !accessToken) {
@@ -525,7 +529,7 @@ router.get("/embedded-config", (_req, res) => {
 // Embedded Signup — exchanges the FB auth code for a long-lived token,
 // verifies the phone number, and saves the connection. Called after the
 // frontend's WA_EMBEDDED_SIGNUP popup finishes.
-router.post("/embedded-connect", async (req, res, next) => {
+router.post("/embedded-connect", requireWhatsApp, async (req, res, next) => {
   try {
     const { code, phoneNumberId, wabaId = "", businessId = "", pin } = req.body || {};
     if (!code || !phoneNumberId) {
@@ -1235,6 +1239,13 @@ router.post("/send-template", requireWa, async (req, res, next) => {
     const { to, templateName, language = "en_US", parameters = [] } = req.body || {};
     if (!to || !templateName) return res.status(400).json({ error: "to and templateName required" });
 
+    {
+      const { whatsappQuota } = require("./middleware/plan");
+      const q = await whatsappQuota(req);
+      if (q.expired) return res.status(402).json({ error: "Your free trial has ended. Subscribe to send WhatsApp messages.", upgrade: true, trialExpired: true });
+      if (q.messagesLeftToday < 1) return res.status(402).json({ error: `Daily WhatsApp message limit reached for the ${q.plan.name} plan. Try again tomorrow or upgrade.`, upgrade: true });
+    }
+
     const result = await sendTemplate(req.wa.accessToken, req.wa.phoneNumberId, to, templateName, language, parameters);
     const messageId = result?.messages?.[0]?.id || "";
 
@@ -1448,6 +1459,12 @@ router.post("/send-text", requireWa, async (req, res, next) => {
   try {
     const { to, body } = req.body || {};
     if (!to || !body) return res.status(400).json({ error: "to and body required" });
+    {
+      const { whatsappQuota } = require("./middleware/plan");
+      const q = await whatsappQuota(req);
+      if (q.expired) return res.status(402).json({ error: "Your free trial has ended. Subscribe to send WhatsApp messages.", upgrade: true, trialExpired: true });
+      if (q.messagesLeftToday < 1) return res.status(402).json({ error: `Daily WhatsApp message limit reached for the ${q.plan.name} plan. Try again tomorrow or upgrade.`, upgrade: true });
+    }
     const result = await sendText(req.wa.accessToken, req.wa.phoneNumberId, to, body);
     const messageId = result?.messages?.[0]?.id || "";
     await WhatsAppMessage.create({
@@ -1468,6 +1485,19 @@ router.post("/bulk-messages", requireWa, async (req, res, next) => {
 
     const contacts = await WhatsAppContact.find({ _id: { $in: contactIds }, user: req.user._id });
     if (!contacts.length) return res.status(404).json({ error: "No matching contacts" });
+
+    // Enforce the per-plan WhatsApp quota (Starter: 100 msgs/day · 15 campaigns/mo).
+    {
+      const { whatsappQuota } = require("./middleware/plan");
+      const q = await whatsappQuota(req);
+      if (q.expired) return res.status(402).json({ error: "Your free trial has ended. Subscribe to send WhatsApp campaigns.", upgrade: true, trialExpired: true });
+      if (q.campaignsLeftThisMonth < 1) {
+        return res.status(402).json({ error: `Monthly WhatsApp campaign limit reached for the ${q.plan.name} plan. Please upgrade.`, upgrade: true, campaignsLeft: 0 });
+      }
+      if (contacts.length > q.messagesLeftToday) {
+        return res.status(402).json({ error: `Daily WhatsApp message limit for the ${q.plan.name} plan: ${q.messagesLeftToday} left today (you selected ${contacts.length}). Reduce recipients or upgrade.`, upgrade: true, messagesLeftToday: q.messagesLeftToday });
+      }
+    }
 
     const campaign = await WhatsAppCampaign.create({
       user: req.user._id,
@@ -2141,6 +2171,20 @@ router.post("/chatbots", async (req, res, next) => {
     const { name, description = "", status = "draft", fallback, steps = [], type = "manual", ai, phoneNumberId = "", phoneNumber = "" } = req.body || {};
     if (!name) return res.status(400).json({ error: "name required" });
     const isAi = type === "ai";
+    // Chatbot tiers: Starter = none · Growth = manual · Pro = manual + AI.
+    {
+      const { accessState } = require("./middleware/plan");
+      const st = accessState(req.user);
+      if (st.expired) {
+        return res.status(402).json({ error: "Your free trial has ended. Subscribe to use chatbots.", upgrade: true, trialExpired: true });
+      }
+      if (isAi && !st.plan.features.aiChatbot) {
+        return res.status(402).json({ error: `The WhatsApp AI chatbot requires the Pro plan. Your ${st.plan.name} plan doesn't include it.`, upgrade: true, feature: "aiChatbot" });
+      }
+      if (!isAi && !st.plan.features.whatsappManualChatbot) {
+        return res.status(402).json({ error: `WhatsApp chatbots require the Growth plan or higher. Your ${st.plan.name} plan doesn't include them.`, upgrade: true, feature: "whatsappManualChatbot" });
+      }
+    }
     const bot = await WhatsAppChatbot.create({
       user: req.user._id, name, description, status, type: isAi ? "ai" : "manual",
       phoneNumberId, phoneNumber,

@@ -185,7 +185,7 @@ router.get("/google/callback", async (req, res) => {
     if (tokens.expiry_date) set.expiryDate = new Date(tokens.expiry_date);
 
     await GoogleAccount.findOneAndUpdate(
-      { user: decoded.uid },
+      { user: decoded.uid, organization: decoded.org || null },
       { $set: set },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     );
@@ -203,7 +203,7 @@ router.get("/booking/:bookingTypeId", async (req, res, next) => {
     if (!bt) return res.status(404).json({ error: "Booking link not found" });
 
     const [avail, taken] = await Promise.all([
-      Availability.findOne({ user: bt.user }),
+      Availability.findOne({ user: bt.user, organization: bt.organization || null }),
       Booking.find({ bookingType: bt._id, status: "confirmed" }).select("slot"),
     ]);
 
@@ -235,6 +235,7 @@ router.post("/booking/:bookingTypeId", async (req, res, next) => {
       booking = await Booking.create({
         bookingType: bt._id,
         host: bt.user,
+        organization: bt.organization || null,
         slot: slotDate,
         duration: bt.duration,
         name, email, phone, notes,
@@ -251,6 +252,7 @@ router.post("/booking/:bookingTypeId", async (req, res, next) => {
     // Mirror the booking into the host's calendar so it shows up in Month/Week/Agenda.
     const calEvent = await CalendarEvent.create({
       user: bt.user,
+      organization: bt.organization || null,
       type: "meeting",
       title: `${bt.name} — ${name}`,
       start: slotDate,
@@ -264,9 +266,9 @@ router.post("/booking/:bookingTypeId", async (req, res, next) => {
     // invite the attendee — Google then adds it to both calendars + emails them.
     let meetLink = "";
     try {
-      const account = await googleSvc.getAccountForUser(bt.user);
+      const account = await googleSvc.getAccountForUser(bt.user, bt.organization || null);
       if (account && account.refreshToken) {
-        const avail = await Availability.findOne({ user: bt.user });
+        const avail = await Availability.findOne({ user: bt.user, organization: bt.organization || null });
         const tz = avail?.timezone || "Asia/Kolkata";
         const host = await User.findById(bt.user).select("name email");
         const ev = await googleSvc.createMeetEvent(account, {
@@ -289,7 +291,7 @@ router.post("/booking/:bookingTypeId", async (req, res, next) => {
     }
 
     // Branded confirmation email (best-effort). Google also sends its own invite.
-    const avail = await Availability.findOne({ user: bt.user });
+    const avail = await Availability.findOne({ user: bt.user, organization: bt.organization || null });
     const whenStr = fmtWhen(slotDate, avail?.timezone);
     const meetRow = meetLink
       ? `<p style="margin:8px 0"><strong>Join link:</strong> <a href="${meetLink}" style="color:#7c3aed">${meetLink}</a></p>`

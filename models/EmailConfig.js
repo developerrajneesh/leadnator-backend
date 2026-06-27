@@ -4,6 +4,10 @@ const schema = new mongoose.Schema(
   {
     user:         { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
     organization: { type: mongoose.Schema.Types.ObjectId, ref: "Organization", index: true },
+    // NOTE: email config is scoped PER ORGANIZATION (one verified domain per org).
+    // Older databases may still carry a stale unique index on `user` alone, which
+    // wrongly shares one config across all of a user's orgs — drop it with
+    // scripts/fix-emailconfig-index.js.
     host:       { type: String, default: "smtp.gmail.com" },
     port:       { type: Number, default: 587 },
     secure:     { type: Boolean, default: false },
@@ -62,5 +66,9 @@ const schema = new mongoose.Schema(
     },
   }
 );
+
+// One email config per (user, organization). Legacy personal configs (no org)
+// have organization: null and still get their own slot under this key.
+schema.index({ user: 1, organization: 1 }, { unique: true });
 
 module.exports = mongoose.models.EmailConfig || mongoose.model("EmailConfig", schema);

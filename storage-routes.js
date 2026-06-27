@@ -6,13 +6,21 @@ const multer = require("multer");
 const StorageItem   = require("./models/StorageItem");
 const StorageConfig = require("./models/StorageConfig");
 const upload = require("./services/uploadFiles");
+const { tenantId } = require("./middleware/tenant");
 
 const router = express.Router();
 
-// Load the current user's S3 creds (with secrets unmasked). Returns null if
-// the user hasn't saved any — handlers should treat that as unconfigured.
-async function loadCfg(userId) {
-  return StorageConfig.findOne({ user: userId })
+// Tenant scope for EVERY storage query/write. A user's files & bucket config are
+// isolated PER ORGANIZATION (tenantId = active org id, or the user id when no
+// org is selected). Without this, one workspace's files leak into another.
+function scope(req, extra = {}) {
+  return { user: req.user._id, organization: tenantId(req), ...extra };
+}
+
+// Load this workspace's S3 creds (with secrets unmasked). Returns null if not
+// configured — handlers treat that as unconfigured.
+async function loadCfg(req) {
+  return StorageConfig.findOne(scope(req))
     .select("+accessKeyId +secretAccessKey");
 }
 
@@ -42,7 +50,7 @@ function pickExt(name = "") {
 // ---------- CONFIG — per-user S3 credentials ----------
 router.get("/config", async (req, res, next) => {
   try {
-    const cfg = await loadCfg(req.user._id);
+    const cfg = await loadCfg(req);
     res.json({
       configured: upload.isConfigured(cfg),
       bucket: cfg?.bucketName || "",
@@ -77,8 +85,8 @@ router.put("/config", async (req, res, next) => {
     if (secretAccessKey?.trim()) patch.secretAccessKey = secretAccessKey.trim();
 
     const cfg = await StorageConfig.findOneAndUpdate(
-      { user: req.user._id },
-      { $set: { ...patch, user: req.user._id } },
+      { ...scope(req) },
+      { $set: { ...patch, ...scope(req) } },
       { new: true, upsert: true, setDefaultsOnInsert: true }
     ).select("+accessKeyId +secretAccessKey");
     res.json({ config: cfg.toJSON(), ok: true });
@@ -87,7 +95,7 @@ router.put("/config", async (req, res, next) => {
 
 router.post("/config/verify", async (req, res, next) => {
   try {
-    const cfg = await loadCfg(req.user._id);
+    const cfg = await loadCfg(req);
     if (!upload.isConfigured(cfg)) return res.status(400).json({ error: "Save all fields first." });
     try {
       await upload.verify({
@@ -107,7 +115,7 @@ router.post("/config/verify", async (req, res, next) => {
 
 router.delete("/config", async (req, res, next) => {
   try {
-    await StorageConfig.deleteOne({ user: req.user._id });
+    await StorageConfig.deleteOne({ ...scope(req) });
     res.json({ ok: true });
   } catch (err) { next(err); }
 });
@@ -117,7 +125,7 @@ router.get("/items", async (req, res, next) => {
   try {
     const parentPath = normPath(req.query.path || "/");
     const items = await StorageItem
-      .find({ user: req.user._id, parentPath, deleted: false })
+      .find({ ...scope(req), parentPath, deleted: false })
       .sort({ type: 1, name: 1 });   // folders first then files (alphabetical)
     res.json({ items, parentPath });
   } catch (err) { next(err); }
@@ -127,7 +135,7 @@ router.get("/items", async (req, res, next) => {
 router.get("/recent", async (req, res, next) => {
   try {
     const items = await StorageItem
-      .find({ user: req.user._id, type: "file", deleted: false })
+      .find({ ...scope(req), type: "file", deleted: false })
       .sort({ updatedAt: -1 }).limit(30);
     res.json({ items });
   } catch (err) { next(err); }
@@ -137,7 +145,7 @@ router.get("/recent", async (req, res, next) => {
 router.get("/trash", async (req, res, next) => {
   try {
     const items = await StorageItem
-      .find({ user: req.user._id, deleted: true })
+      .find({ ...scope(req), deleted: true })
       .sort({ deletedAt: -1 });
     res.json({ items });
   } catch (err) { next(err); }
@@ -158,19 +166,19 @@ router.get("/shared", async (req, res, next) => {
 router.get("/stats", async (req, res, next) => {
   try {
     const [total, files, folders, trashed, agg] = await Promise.all([
-      StorageItem.countDocuments({ user: req.user._id, deleted: false }),
-      StorageItem.countDocuments({ user: req.user._id, type: "file",   deleted: false }),
-      StorageItem.countDocuments({ user: req.user._id, type: "folder", deleted: false }),
-      StorageItem.countDocuments({ user: req.user._id, deleted: true }),
+      StorageItem.countDocuments({ ...scope(req), deleted: false }),
+      StorageItem.countDocuments({ ...scope(req), type: "file",   deleted: false }),
+      StorageItem.countDocuments({ ...scope(req), type: "folder", deleted: false }),
+      StorageItem.countDocuments({ ...scope(req), deleted: true }),
       StorageItem.aggregate([
-        { $match: { user: req.user._id, type: "file", deleted: false } },
+        { $match: { ...scope(req), type: "file", deleted: false } },
         { $group: { _id: null, totalBytes: { $sum: "$size" } } },
       ]),
     ]);
     res.json({
       total, files, folders, trashed,
       totalBytes: agg[0]?.totalBytes || 0,
-      configured: upload.isConfigured(await loadCfg(req.user._id)),
+      configured: upload.isConfigured(await loadCfg(req)),
     });
   } catch (err) { next(err); }
 });
@@ -185,12 +193,12 @@ router.post("/folders", async (req, res, next) => {
 
     // Block duplicate folder names at this level
     const exists = await StorageItem.findOne({
-      user: req.user._id, parentPath: parent, name: safeName, type: "folder", deleted: false,
+      ...scope(req), parentPath: parent, name: safeName, type: "folder", deleted: false,
     });
     if (exists) return res.status(409).json({ error: "A folder with that name already exists here." });
 
     const item = await StorageItem.create({
-      user: req.user._id,
+      ...scope(req),
       name: safeName,
       type: "folder",
       parentPath: parent,
@@ -203,7 +211,7 @@ router.post("/folders", async (req, res, next) => {
 // ---------- UPLOAD file(s) ----------
 router.post("/upload", mu.array("files", 10), async (req, res, next) => {
   try {
-    const cfg = await loadCfg(req.user._id);
+    const cfg = await loadCfg(req);
     if (!upload.isConfigured(cfg)) {
       return res.status(400).json({ error: "Storage not configured. Save your S3 credentials in Storage → Settings first." });
     }
@@ -221,7 +229,7 @@ router.post("/upload", mu.array("files", 10), async (req, res, next) => {
         mimeType: f.mimetype,
       });
       const item = await StorageItem.create({
-        user: req.user._id,
+        ...scope(req),
         name: f.originalname,
         type: "file",
         parentPath,
@@ -240,7 +248,7 @@ router.post("/upload", mu.array("files", 10), async (req, res, next) => {
 router.delete("/items/:id", async (req, res, next) => {
   try {
     const item = await StorageItem.findOneAndUpdate(
-      { _id: req.params.id, user: req.user._id, deleted: false },
+      { _id: req.params.id, ...scope(req), deleted: false },
       { deleted: true, deletedAt: new Date() },
       { new: true }
     );
@@ -253,7 +261,7 @@ router.delete("/items/:id", async (req, res, next) => {
 router.post("/items/:id/restore", async (req, res, next) => {
   try {
     const item = await StorageItem.findOneAndUpdate(
-      { _id: req.params.id, user: req.user._id, deleted: true },
+      { _id: req.params.id, ...scope(req), deleted: true },
       { $set: { deleted: false }, $unset: { deletedAt: 1 } },
       { new: true }
     );
@@ -265,11 +273,11 @@ router.post("/items/:id/restore", async (req, res, next) => {
 // ---------- PERMANENT DELETE (purge) ----------
 router.delete("/items/:id/purge", async (req, res, next) => {
   try {
-    const item = await StorageItem.findOne({ _id: req.params.id, user: req.user._id });
+    const item = await StorageItem.findOne({ _id: req.params.id, ...scope(req) });
     if (!item) return res.status(404).json({ error: "Item not found" });
     if (item.type === "file" && item.s3Key) {
       try {
-        const cfg = await loadCfg(req.user._id);
+        const cfg = await loadCfg(req);
         if (upload.isConfigured(cfg)) await upload.deleteKey(cfg, item.s3Key);
       } catch (e) { console.warn("S3 delete failed:", e.message); }
     }
@@ -280,13 +288,13 @@ router.delete("/items/:id/purge", async (req, res, next) => {
 
 router.post("/trash/empty", async (req, res, next) => {
   try {
-    const items = await StorageItem.find({ user: req.user._id, deleted: true });
+    const items = await StorageItem.find({ ...scope(req), deleted: true });
     const keys = items.filter((i) => i.s3Key).map((i) => i.s3Key);
     try {
-      const cfg = await loadCfg(req.user._id);
+      const cfg = await loadCfg(req);
       if (upload.isConfigured(cfg)) await upload.deleteKeys(cfg, keys);
     } catch (e) { console.warn("S3 bulk delete failed:", e.message); }
-    await StorageItem.deleteMany({ user: req.user._id, deleted: true });
+    await StorageItem.deleteMany({ ...scope(req), deleted: true });
     res.json({ purged: items.length });
   } catch (err) { next(err); }
 });
@@ -294,10 +302,10 @@ router.post("/trash/empty", async (req, res, next) => {
 // ---------- DOWNLOAD URL (signed) ----------
 router.get("/items/:id/url", async (req, res, next) => {
   try {
-    const item = await StorageItem.findOne({ _id: req.params.id, user: req.user._id, type: "file" });
+    const item = await StorageItem.findOne({ _id: req.params.id, ...scope(req), type: "file" });
     if (!item) return res.status(404).json({ error: "File not found" });
     if (!item.s3Key) return res.status(400).json({ error: "No object key on file" });
-    const cfg = await loadCfg(req.user._id);
+    const cfg = await loadCfg(req);
     if (!upload.isConfigured(cfg)) return res.status(400).json({ error: "Storage not configured for this user." });
     const url = upload.getSignedUrl(cfg, item.s3Key, Number(req.query.expires) || 3600);
     res.json({ url, expiresIn: 3600 });
@@ -308,7 +316,7 @@ router.get("/items/:id/url", async (req, res, next) => {
 router.put("/items/:id/share", async (req, res, next) => {
   try {
     const { add = [], remove = [] } = req.body || {};
-    const item = await StorageItem.findOne({ _id: req.params.id, user: req.user._id });
+    const item = await StorageItem.findOne({ _id: req.params.id, ...scope(req) });
     if (!item) return res.status(404).json({ error: "Item not found" });
     const set = new Set(item.sharedWith || []);
     add.forEach((e) => e && set.add(String(e).toLowerCase()));

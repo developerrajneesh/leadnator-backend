@@ -7,7 +7,8 @@ const slotSchema = new mongoose.Schema(
 
 const schema = new mongoose.Schema(
   {
-    user:      { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, unique: true, index: true },
+    user:         { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: "Organization", index: true },
     timezone:  { type: String, default: "Asia/Kolkata" },
     slots:     [slotSchema],
     buffer:    { type: Number, default: 15 },
@@ -26,5 +27,8 @@ const schema = new mongoose.Schema(
     },
   }
 );
+
+// One availability profile per (user, organization).
+schema.index({ user: 1, organization: 1 }, { unique: true });
 
 module.exports = mongoose.models.Availability || mongoose.model("Availability", schema);

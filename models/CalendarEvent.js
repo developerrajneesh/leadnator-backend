@@ -2,7 +2,8 @@ const mongoose = require("mongoose");
 
 const schema = new mongoose.Schema(
   {
-    user:     { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    user:         { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: "Organization", index: true },
     type:     { type: String, enum: ["meeting", "demo", "call", "followup", "task"], default: "meeting" },
     title:    { type: String, required: true, trim: true },
     start:    { type: Date, required: true, index: true },
@@ -28,6 +29,6 @@ const schema = new mongoose.Schema(
   }
 );
 
-schema.index({ user: 1, start: 1 });
+schema.index({ user: 1, organization: 1, start: 1 });
 
 module.exports = mongoose.models.CalendarEvent || mongoose.model("CalendarEvent", schema);

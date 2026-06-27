@@ -3,10 +3,14 @@
 
 const express = require("express");
 const aiService = require("./services/aiService");
+const { requireFeature } = require("./middleware/plan");
 
 const router = express.Router();
 
-router.post("/generate", async (req, res, next) => {
+// AI content tools are a Pro-plan feature.
+const requireAiTools = requireFeature("aiTools", "AI tools");
+
+router.post("/generate", requireAiTools, async (req, res, next) => {
   try {
     const { type = "ad", brief = {}, prompt, model } = req.body || {};
     const result = await aiService.generate({ type, brief, prompt, model });
@@ -14,7 +18,7 @@ router.post("/generate", async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-router.post("/text", async (req, res, next) => {
+router.post("/text", requireAiTools, async (req, res, next) => {
   try {
     const { prompt, system, model, temperature } = req.body || {};
     if (!prompt) return res.status(400).json({ error: "prompt required" });

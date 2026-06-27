@@ -4,8 +4,8 @@ const mongoose = require("mongoose");
 // so they never leak into normal queries / API responses.
 const schema = new mongoose.Schema(
   {
-    user:         { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, unique: true, index: true },
-    organization: { type: mongoose.Schema.Types.ObjectId, ref: "Organization", default: null },
+    user:         { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: "Organization", default: null, index: true },
     email:        { type: String, default: "" },
     accessToken:  { type: String, select: false },
     refreshToken: { type: String, select: false },
@@ -28,5 +28,10 @@ const schema = new mongoose.Schema(
     },
   }
 );
+
+// One Google connection per (user, organization) — each workspace links its own
+// Google account. (Older DBs may carry a stale unique index on `user` alone;
+// drop it with scripts/backfill-calendar-org.js.)
+schema.index({ user: 1, organization: 1 }, { unique: true });
 
 module.exports = mongoose.models.GoogleAccount || mongoose.model("GoogleAccount", schema);

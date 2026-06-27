@@ -20,8 +20,17 @@ const {
 } = require("@aws-sdk/client-ses");
 const { sendViaSes, sesReady, resolveSender } = require("./services/sesSend");
 const { emitToUser } = require("./services/socket");
+const { emailQuota } = require("./middleware/plan");
 
 const router = express.Router();
+
+// Tenant scope for EVERY email query/write. A user's email data (subscribers,
+// templates, campaigns, mailbox, logs) is isolated PER ORGANIZATION — tenantId
+// is the active org id (or the user id when no org is selected). Without this,
+// one workspace's data leaks into another.
+function scope(req, extra = {}) {
+  return { user: req.user._id, organization: tenantId(req), ...extra };
+}
 
 function cleanDomain(input = "") {
   const raw = String(input || "").trim().toLowerCase();
@@ -80,7 +89,11 @@ function sesClient() {
 async function loadConfig(req) {
   const tid = tenantId(req);
   let cfg = await EmailConfig.findOne({ organization: tid }).select("+password");
-  if (!cfg) {
+  // Legacy migration ONLY when there is no active organization (tid === user id):
+  // adopt an old personal config from before orgs existed. When the user is
+  // inside an organization we must NOT fall back to any other scope, or one
+  // org's verified domain leaks into another.
+  if (!cfg && !req.tenantId) {
     cfg = await EmailConfig.findOne({
       user: req.user._id,
       $or: [{ organization: null }, { organization: { $exists: false } }],
@@ -126,11 +139,22 @@ router.get("/config", async (req, res, next) => {
   try {
     let cfg = await loadConfig(req);
     if (!cfg) {
-      cfg = await EmailConfig.create({
-        user: req.user._id,
-        organization: tenantId(req),
-        host: "smtp.gmail.com", port: 587, secure: false,
-      });
+      // Create the default config — but tolerate a race: if two requests load
+      // at once (the connect screen fires several config() calls), both may try
+      // to insert and one hits the unique (user) index. Re-fetch on E11000.
+      try {
+        cfg = await EmailConfig.create({
+          user: req.user._id,
+          organization: tenantId(req),
+          host: "smtp.gmail.com", port: 587, secure: false,
+        });
+      } catch (e) {
+        if (e?.code === 11000) {
+          // A concurrent request created this tenant's config first — re-fetch it
+          // (org-scoped, so we never adopt a different tenant's config).
+          cfg = await loadConfig(req);
+        } else throw e;
+      }
     }
     // Lazily migrate a legacy single sender into senders[] so the UI sees it.
     if ((cfg.senders || []).length === 0 && cfg.sesFromEmail) {
@@ -369,7 +393,7 @@ router.post("/ses/test-send", async (req, res, next) => {
     }));
 
     EmailLog.create({
-      user: req.user._id,
+      ...scope(req),
       to,
       subject: "Test email from Leadnator (Amazon SES)",
       html: `SES test from ${fromEmail}`,
@@ -415,6 +439,12 @@ router.post("/quick-send", async (req, res, next) => {
       return res.status(400).json({ error: "Set up your sending domain under Email → Config first." });
     }
 
+    const q = await emailQuota(req);
+    if (q.expired) return res.status(402).json({ error: "Your free trial has ended. Subscribe to send emails.", upgrade: true, trialExpired: true });
+    if (q.dailyLeft < 1 || q.monthlyLeft < 1) {
+      return res.status(402).json({ error: `Email limit reached for the ${q.plan.name} plan. Please upgrade.`, upgrade: true });
+    }
+
     try {
       const info = await sendViaSes(cfg, {
         to,
@@ -422,11 +452,11 @@ router.post("/quick-send", async (req, res, next) => {
         html: withSignature(html, cfg, useSignature !== false),
         replyTo: cfg.replyTo || undefined,
       });
-      EmailLog.create({ user: req.user._id, to, subject, html, messageId: info.messageId, status: "sent" })
+      EmailLog.create({ ...scope(req), to, subject, html, messageId: info.messageId, status: "sent" })
         .catch((e) => console.warn("[email log] persist failed:", e.message));
       res.json({ ok: true, messageId: info.messageId });
     } catch (sendErr) {
-      EmailLog.create({ user: req.user._id, to, subject, html, status: "failed", error: sendErr.message })
+      EmailLog.create({ ...scope(req), to, subject, html, status: "failed", error: sendErr.message })
         .catch(() => {});
       throw sendErr;
     }
@@ -442,7 +472,7 @@ router.get("/quick-send/history", async (req, res, next) => {
     const to = String(req.query.to || "").trim().toLowerCase();
     if (!to) return res.status(400).json({ error: "'to' query param required" });
     const limit = Math.min(Number(req.query.limit) || 20, 100);
-    const logs = await EmailLog.find({ user: req.user._id, to }).sort({ ts: -1 }).limit(limit);
+    const logs = await EmailLog.find(scope(req, { to })).sort({ ts: -1 }).limit(limit);
     res.json({ history: logs.map((l) => l.toJSON()).reverse() });
   } catch (err) { next(err); }
 });
@@ -450,7 +480,7 @@ router.get("/quick-send/history", async (req, res, next) => {
 // ---------- TEMPLATES ----------
 router.get("/templates", async (req, res, next) => {
   try {
-    const list = await EmailTemplate.find({ user: req.user._id }).sort({ createdAt: -1 });
+    const list = await EmailTemplate.find(scope(req)).sort({ createdAt: -1 });
     res.json({ templates: list });
   } catch (err) { next(err); }
 });
@@ -459,7 +489,7 @@ router.post("/templates", async (req, res, next) => {
   try {
     const { name, subject, body, category = "general" } = req.body || {};
     if (!name || !subject || !body) return res.status(400).json({ error: "name, subject, body required" });
-    const t = await EmailTemplate.create({ user: req.user._id, name, subject, body, category });
+    const t = await EmailTemplate.create({ ...scope(req), name, subject, body, category });
     res.status(201).json({ template: t });
   } catch (err) { next(err); }
 });
@@ -468,7 +498,7 @@ router.put("/templates/:id", async (req, res, next) => {
   try {
     const { _id, id, user, ...patch } = req.body || {};
     const t = await EmailTemplate.findOneAndUpdate(
-      { _id: req.params.id, user: req.user._id }, patch, { new: true, runValidators: true }
+      scope(req, { _id: req.params.id }), patch, { new: true, runValidators: true }
     );
     if (!t) return res.status(404).json({ error: "Template not found" });
     res.json({ template: t });
@@ -477,7 +507,7 @@ router.put("/templates/:id", async (req, res, next) => {
 
 router.delete("/templates/:id", async (req, res, next) => {
   try {
-    const r = await EmailTemplate.deleteOne({ _id: req.params.id, user: req.user._id });
+    const r = await EmailTemplate.deleteOne(scope(req, { _id: req.params.id }));
     if (!r.deletedCount) return res.status(404).json({ error: "Template not found" });
     res.json({ deleted: req.params.id });
   } catch (err) { next(err); }
@@ -487,7 +517,7 @@ router.delete("/templates/:id", async (req, res, next) => {
 router.get("/subscribers", async (req, res, next) => {
   try {
     const { q = "", status = "all" } = req.query;
-    const filter = { user: req.user._id };
+    const filter = scope(req);
     if (status !== "all") filter.status = status;
     if (q.trim()) {
       const rx = new RegExp(q.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
@@ -502,7 +532,7 @@ router.post("/subscribers", async (req, res, next) => {
   try {
     const { name = "", email, tags = [] } = req.body || {};
     if (!email) return res.status(400).json({ error: "email required" });
-    const s = await EmailSubscriber.create({ user: req.user._id, name, email, tags });
+    const s = await EmailSubscriber.create({ ...scope(req), name, email, tags });
     res.status(201).json({ subscriber: s });
   } catch (err) {
     if (err.code === 11000) return res.status(409).json({ error: "That email is already subscribed." });
@@ -514,7 +544,7 @@ router.put("/subscribers/:id", async (req, res, next) => {
   try {
     const { _id, id, user, ...patch } = req.body || {};
     const s = await EmailSubscriber.findOneAndUpdate(
-      { _id: req.params.id, user: req.user._id }, patch, { new: true, runValidators: true }
+      scope(req, { _id: req.params.id }), patch, { new: true, runValidators: true }
     );
     if (!s) return res.status(404).json({ error: "Subscriber not found" });
     res.json({ subscriber: s });
@@ -523,7 +553,7 @@ router.put("/subscribers/:id", async (req, res, next) => {
 
 router.delete("/subscribers/:id", async (req, res, next) => {
   try {
-    const r = await EmailSubscriber.deleteOne({ _id: req.params.id, user: req.user._id });
+    const r = await EmailSubscriber.deleteOne(scope(req, { _id: req.params.id }));
     if (!r.deletedCount) return res.status(404).json({ error: "Subscriber not found" });
     res.json({ deleted: req.params.id });
   } catch (err) { next(err); }
@@ -535,7 +565,7 @@ router.post("/subscribers/bulk", async (req, res, next) => {
     const docs = list
       .filter((s) => s?.email)
       .map((s) => ({
-        user: req.user._id,
+        ...scope(req),
         name: String(s.name || "").trim(),
         email: String(s.email).trim().toLowerCase(),
         tags: Array.isArray(s.tags) ? s.tags : [],
@@ -554,7 +584,7 @@ router.post("/subscribers/bulk", async (req, res, next) => {
 // ---------- CAMPAIGNS ----------
 router.get("/campaigns", async (req, res, next) => {
   try {
-    const list = await EmailCampaign.find({ user: req.user._id })
+    const list = await EmailCampaign.find(scope(req))
       .populate("template", "name").sort({ createdAt: -1 });
     res.json({ campaigns: list });
   } catch (err) { next(err); }
@@ -563,7 +593,7 @@ router.get("/campaigns", async (req, res, next) => {
 // Single campaign + its per-recipient delivery log (for the detail/analytics view).
 router.get("/campaigns/:id", async (req, res, next) => {
   try {
-    const camp = await EmailCampaign.findOne({ _id: req.params.id, user: req.user._id })
+    const camp = await EmailCampaign.findOne(scope(req, { _id: req.params.id }))
       .populate("template", "name")
       .populate("recipients", "name email status");
     if (!camp) return res.status(404).json({ error: "Campaign not found" });
@@ -579,7 +609,7 @@ router.post("/campaigns", async (req, res, next) => {
     const { name, subject, body, templateId, recipientIds = [], senderId = "" } = req.body || {};
     if (!name || !subject || !body) return res.status(400).json({ error: "name, subject, body required" });
     const c = await EmailCampaign.create({
-      user: req.user._id, name, subject, body,
+      ...scope(req), name, subject, body,
       template: templateId || null,
       senderId: senderId || "",
       recipients: recipientIds,
@@ -591,7 +621,7 @@ router.post("/campaigns", async (req, res, next) => {
 
 router.delete("/campaigns/:id", async (req, res, next) => {
   try {
-    const r = await EmailCampaign.deleteOne({ _id: req.params.id, user: req.user._id });
+    const r = await EmailCampaign.deleteOne(scope(req, { _id: req.params.id }));
     if (!r.deletedCount) return res.status(404).json({ error: "Campaign not found" });
     res.json({ deleted: req.params.id });
   } catch (err) { next(err); }
@@ -604,12 +634,22 @@ router.post("/campaigns/:id/send", async (req, res, next) => {
     if (!sesReady(cfg)) {
       return res.status(400).json({ error: "Set up & verify your sending domain under Email → Config first." });
     }
-    const camp = await EmailCampaign.findOne({ _id: req.params.id, user: req.user._id })
+    const camp = await EmailCampaign.findOne(scope(req, { _id: req.params.id }))
       .populate("recipients", "name email status");
     if (!camp) return res.status(404).json({ error: "Campaign not found" });
 
     const recipients = (camp.recipients || []).filter((r) => r.status === "active");
     if (!recipients.length) return res.status(400).json({ error: "No active recipients selected" });
+
+    // Enforce the per-plan email quota (monthly + daily).
+    const q = await emailQuota(req);
+    if (q.expired) return res.status(402).json({ error: "Your free trial has ended. Subscribe to send emails.", upgrade: true, trialExpired: true });
+    if (q.dailyLeft < recipients.length) {
+      return res.status(402).json({ error: `Daily email limit reached for the ${q.plan.name} plan (${q.dailyLeft} left today). Upgrade or try tomorrow.`, upgrade: true, dailyLeft: q.dailyLeft });
+    }
+    if (q.monthlyLeft < recipients.length) {
+      return res.status(402).json({ error: `Monthly email limit reached for the ${q.plan.name} plan (${q.monthlyLeft} left this month). Please upgrade.`, upgrade: true, monthlyLeft: q.monthlyLeft });
+    }
 
     // Per-call signature override; defaults to whatever the user has saved.
     // Only honors `useSignature: false` if the saved signature actually has HTML.
@@ -682,10 +722,10 @@ router.post("/campaigns/:id/send", async (req, res, next) => {
 router.get("/stats", async (req, res, next) => {
   try {
     const [campaigns, subs, templates, cfg] = await Promise.all([
-      EmailCampaign.find({ user: req.user._id }),
-      EmailSubscriber.countDocuments({ user: req.user._id, status: "active" }),
-      EmailTemplate.countDocuments({ user: req.user._id }),
-      EmailConfig.findOne({ user: req.user._id }),
+      EmailCampaign.find(scope(req)),
+      EmailSubscriber.countDocuments(scope(req, { status: "active" })),
+      EmailTemplate.countDocuments(scope(req)),
+      loadConfig(req),
     ]);
     const totalSent   = campaigns.reduce((s, c) => s + (c.sent   || 0), 0);
     const totalFailed = campaigns.reduce((s, c) => s + (c.failed || 0), 0);
@@ -714,7 +754,7 @@ function stripQuotedText(text) {
 router.get("/inbox", async (req, res, next) => {
   try {
     const mailbox = String(req.query.mailbox || "").toLowerCase().trim();
-    const match = { user: req.user._id };
+    const match = scope(req);
     if (mailbox) match.mailbox = mailbox;
     const convos = await EmailMessage.aggregate([
       { $match: match },
@@ -756,7 +796,7 @@ router.get("/inbox/:counterparty", async (req, res, next) => {
   try {
     const cp = String(req.params.counterparty || "").toLowerCase();
     const mailbox = String(req.query.mailbox || "").toLowerCase().trim();
-    const filter = { user: req.user._id, counterparty: cp };
+    const filter = scope(req, { counterparty: cp });
     if (mailbox) filter.mailbox = mailbox;
     const messages = await EmailMessage.find(filter).sort({ ts: 1 });
     await EmailMessage.updateMany(
@@ -811,7 +851,7 @@ router.post("/inbox/send", async (req, res, next) => {
 // Unread count across the mailbox — for the sidebar badge.
 router.get("/inbox-unread", async (req, res, next) => {
   try {
-    const unread = await EmailMessage.countDocuments({ user: req.user._id, direction: "inbound", read: false });
+    const unread = await EmailMessage.countDocuments(scope(req, { direction: "inbound", read: false }));
     res.json({ unread });
   } catch (err) { next(err); }
 });

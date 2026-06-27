@@ -1,6 +1,7 @@
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const TeamMember = require("../models/TeamMember");
+const { PLANS } = require("../config/plans");
 
 function signUserToken(user) {
   return jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, {
@@ -21,7 +22,14 @@ exports.signup = async (req, res) => {
   const exists = await User.findOne({ email });
   if (exists) return res.status(409).json({ error: "Email already in use" });
 
-  const user = await User.create({ name, email, password });
+  // New users get a 2-day free Starter trial.
+  const trialDays = PLANS.starter.trialDays || 2;
+  const trialEndsAt = new Date(Date.now() + trialDays * 86400000);
+  const user = await User.create({
+    name, email, password,
+    plan: "Starter", planKey: "starter",
+    subscriptionActive: false, trialEndsAt,
+  });
   const token = signUserToken(user);
   res.status(201).json({ token, user: user.toSafeJSON() });
 };

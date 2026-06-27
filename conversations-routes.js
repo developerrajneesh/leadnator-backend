@@ -4,8 +4,17 @@ const express = require("express");
 const Lead = require("./models/Lead");
 const EmailMessage = require("./models/EmailMessage");
 const WhatsAppMessage = require("./models/WhatsAppMessage");
+const WhatsAppConnection = require("./models/WhatsAppConnection");
+const { tenantId, leadFilter } = require("./middleware/tenant");
 
 const router = express.Router();
+
+// The WhatsApp number connected to the CURRENT organization. Messages are tagged
+// by phoneNumberId, so this is how we keep one workspace's chats out of another.
+async function orgWaPhoneNumberId(req) {
+  const conn = await WhatsAppConnection.findOne({ organization: tenantId(req) }).select("phoneNumberId");
+  return conn?.phoneNumberId || null;
+}
 
 const digits = (s) => String(s || "").replace(/\D/g, "");
 const preview = (s) =>
@@ -15,9 +24,11 @@ const preview = (s) =>
 router.get("/", async (req, res, next) => {
   try {
     const uid = req.user._id;
+    const org = tenantId(req);
+    const waPhoneId = await orgWaPhoneNumberId(req);
     const [emailConvos, waConvos, leads] = await Promise.all([
       EmailMessage.aggregate([
-        { $match: { user: uid } },
+        { $match: { user: uid, organization: org } },
         { $sort: { ts: -1 } },
         { $group: {
             _id: "$counterparty",
@@ -26,12 +37,15 @@ router.get("/", async (req, res, next) => {
             unread: { $sum: { $cond: [{ $and: [{ $eq: ["$direction", "inbound"] }, { $eq: ["$read", false] }] }, 1, 0] } },
         } },
       ]),
-      WhatsAppMessage.aggregate([
-        { $match: { user: uid } },
-        { $sort: { ts: -1 } },
-        { $group: { _id: "$contactPhone", last: { $first: "$$ROOT" }, ts: { $first: "$ts" } } },
-      ]),
-      Lead.find({ owner: uid }).select("name email phone").lean(),
+      // Only this org's connected WhatsApp number. No number → no WhatsApp chats.
+      waPhoneId
+        ? WhatsAppMessage.aggregate([
+            { $match: { user: uid, phoneNumberId: waPhoneId } },
+            { $sort: { ts: -1 } },
+            { $group: { _id: "$contactPhone", last: { $first: "$$ROOT" }, ts: { $first: "$ts" } } },
+          ])
+        : Promise.resolve([]),
+      Lead.find(leadFilter(req)).select("name email phone").lean(),
     ]);
 
     const byEmail = {}, byPhone = {};
@@ -70,10 +84,11 @@ router.get("/", async (req, res, next) => {
 router.get("/:id", async (req, res, next) => {
   try {
     const uid = req.user._id;
+    const org = tenantId(req);
     const id = decodeURIComponent(req.params.id);
     let lead = null, email = "", phone = "";
     if (id.startsWith("lead:")) {
-      lead = await Lead.findOne({ _id: id.slice(5), owner: uid }).lean();
+      lead = await Lead.findOne({ ...leadFilter(req), _id: id.slice(5) }).lean();
       email = lead?.email || ""; phone = lead?.phone || "";
     } else if (id.startsWith("raw:")) {
       const v = id.slice(4);
@@ -82,13 +97,16 @@ router.get("/:id", async (req, res, next) => {
 
     const msgs = [];
     if (email) {
-      const em = await EmailMessage.find({ user: uid, counterparty: email.toLowerCase() }).sort({ ts: 1 }).lean();
+      const em = await EmailMessage.find({ user: uid, organization: org, counterparty: email.toLowerCase() }).sort({ ts: 1 }).lean();
       for (const m of em) msgs.push({ id: String(m._id), channel: "email", direction: m.direction, from: m.fromName || m.fromEmail, subject: m.subject, html: m.html, text: m.text, ts: m.ts });
-      await EmailMessage.updateMany({ user: uid, counterparty: email.toLowerCase(), direction: "inbound", read: false }, { $set: { read: true } });
+      await EmailMessage.updateMany({ user: uid, organization: org, counterparty: email.toLowerCase(), direction: "inbound", read: false }, { $set: { read: true } });
     }
     if (phone) {
-      const wa = await WhatsAppMessage.find({ user: uid, contactPhone: digits(phone) }).sort({ ts: 1 }).lean();
-      for (const m of wa) msgs.push({ id: String(m._id), channel: "whatsapp", direction: m.direction, text: m.text, ts: m.ts });
+      const waPhoneId = await orgWaPhoneNumberId(req);
+      if (waPhoneId) {
+        const wa = await WhatsAppMessage.find({ user: uid, phoneNumberId: waPhoneId, contactPhone: digits(phone) }).sort({ ts: 1 }).lean();
+        for (const m of wa) msgs.push({ id: String(m._id), channel: "whatsapp", direction: m.direction, text: m.text, ts: m.ts });
+      }
     }
     msgs.sort((a, b) => new Date(a.ts) - new Date(b.ts));
     res.json({ id, contact: { name: lead?.name || "", email, phone, leadId: lead?._id || null }, messages: msgs });

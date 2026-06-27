@@ -2,7 +2,8 @@ const mongoose = require("mongoose");
 
 const schema = new mongoose.Schema(
   {
-    user:      { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    user:         { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: "Organization", index: true },
     to:        { type: String, required: true, index: true, lowercase: true, trim: true },
     subject:   { type: String, default: "" },
     html:      { type: String, default: "" },
