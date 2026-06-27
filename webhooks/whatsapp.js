@@ -303,7 +303,7 @@ async function processMessagingWebhook(entry, change, value) {
         || "";
 
       // Auto-reply via the user's active chatbot (if any).
-      await tryChatbotReply({ conn, fromPhone, text, buttonId }).catch((e) =>
+      await tryChatbotReply({ conn, fromPhone, text, buttonId, messageId: msg.id || "" }).catch((e) =>
         log("✗ chatbot reply failed:", e.message)
       );
     }
@@ -367,7 +367,21 @@ router.post("/", async (req, res) => {
 // its reply text + CTA buttons. Honors multi-step flows by tracking the user's
 // last step on WhatsAppContact and routing through the tapped button's
 // nextStepId when applicable.
-async function tryChatbotReply({ conn, fromPhone, text, buttonId = "" }) {
+// Mark the customer's message as read (blue ticks) AND show a "typing…"
+// indicator while the bot prepares its reply. WhatsApp Cloud API does both in
+// a single call; the typing bubble lasts up to ~25s or until we send a message.
+async function markReadAndTyping(conn, messageId) {
+  if (!messageId) return;
+  try {
+    await axios.post(
+      `${FB_GRAPH_BASE}/${conn.phoneNumberId}/messages`,
+      { messaging_product: "whatsapp", status: "read", message_id: messageId, typing_indicator: { type: "text" } },
+      { params: { access_token: conn.accessToken }, validateStatus: () => true },
+    );
+  } catch (e) { log("mark-read/typing failed:", e.message); }
+}
+
+async function tryChatbotReply({ conn, fromPhone, text, buttonId = "", messageId = "" }) {
   // Prefer the active bot bound to this exact number; fall back to a legacy
   // bot with no number set.
   let bot = await WhatsAppChatbot.findOne({ user: conn.user, status: "active", phoneNumberId: conn.phoneNumberId }).sort({ updatedAt: -1 });
@@ -378,6 +392,9 @@ async function tryChatbotReply({ conn, fromPhone, text, buttonId = "" }) {
     }).sort({ updatedAt: -1 });
   }
   if (!bot) { log("no active chatbot for this number — skipping auto-reply"); return; }
+
+  // Show "seen" + "typing…" before the bot replies.
+  await markReadAndTyping(conn, messageId);
 
   // AI chatbot: answer from the knowledge base instead of running keyword steps.
   if (bot.type === "ai") {
@@ -490,16 +507,34 @@ async function handleAiChatbotReply({ conn, fromPhone, text, bot }) {
   const ai = bot.ai || {};
   let answer = "";
   try {
+    // Pull recent conversation so the bot has memory and doesn't restart/greet
+    // every message. (The current inbound message is already saved, so it's the
+    // last "Customer:" line.)
+    const recent = await WhatsAppMessage.find({ user: conn.user, contactPhone: fromPhone })
+      .sort({ createdAt: -1 }).limit(12).lean();
+    const transcript = recent
+      .reverse()
+      .map((m) => ({ who: m.direction === "inbound" ? "Customer" : "Assistant", t: (m.text || "").trim() }))
+      .filter((m) => m.t)
+      .map((m) => `${m.who}: ${m.t}`)
+      .join("\n");
+
     const system = [
-      "You are a helpful WhatsApp assistant for a business.",
-      "Answer the customer's message using ONLY the knowledge base below.",
-      `If the answer is not in the knowledge base, reply with: ${bot.fallback || "Sorry, I couldn't find that — let me connect you to our team."}`,
-      `Tone: ${ai.tone || "friendly"}. Keep it short and WhatsApp-friendly — plain text, no markdown headings.`,
+      "You are a helpful WhatsApp assistant for a business, in the middle of an ongoing chat with one customer.",
+      "GREET ONLY ONCE: only welcome/greet the customer if there is NO prior conversation. In every later reply, do NOT greet, do NOT say 'Hi/Hello/Welcome', and do NOT re-introduce yourself or repeat the intro questions.",
+      "Never ask again for details the customer has already provided in the conversation — acknowledge them and move forward.",
+      "Answer using ONLY the knowledge base below. If the answer isn't there, reply with: " + (bot.fallback || "Sorry, I couldn't find that — let me connect you to our team."),
+      `Tone: ${ai.tone || "friendly"}. Keep replies short and WhatsApp-friendly — plain text, no markdown headings.`,
       "",
       "KNOWLEDGE BASE:",
       ai.knowledgeBase || "(empty)",
     ].join("\n");
-    const { content } = await generateText({ prompt: String(text || "").slice(0, 1000), system, temperature: 0.4 });
+
+    const prompt = transcript
+      ? `Conversation so far:\n${transcript}\n\nWrite the assistant's next reply to the customer's most recent message. Continue naturally; do not repeat earlier greetings or already-answered questions.`
+      : `The customer's first message: ${String(text || "").slice(0, 1000)}`;
+
+    const { content } = await generateText({ prompt, system, temperature: 0.4 });
     answer = (content || "").trim();
   } catch (e) {
     log("AI chatbot generate failed:", e.message);
