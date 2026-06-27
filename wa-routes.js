@@ -2047,13 +2047,16 @@ router.get("/chatbots/:id", async (req, res, next) => {
 
 router.post("/chatbots", async (req, res, next) => {
   try {
-    const { name, description = "", status = "draft", fallback, steps = [] } = req.body || {};
+    const { name, description = "", status = "draft", fallback, steps = [], type = "manual", ai, phoneNumberId = "", phoneNumber = "" } = req.body || {};
     if (!name) return res.status(400).json({ error: "name required" });
+    const isAi = type === "ai";
     const bot = await WhatsAppChatbot.create({
-      user: req.user._id, name, description, status,
+      user: req.user._id, name, description, status, type: isAi ? "ai" : "manual",
+      phoneNumberId, phoneNumber,
       fallback: fallback || undefined,
-      steps: steps.length ? steps : [
-        // Seed with a sensible starting step so the builder isn't blank.
+      ai: isAi ? (ai || {}) : undefined,
+      steps: isAi ? [] : (steps.length ? steps : [
+        // Seed manual bots with a sensible starting step so the builder isn't blank.
         {
           id: "start",
           isStart: true,
@@ -2064,8 +2067,14 @@ router.post("/chatbots", async (req, res, next) => {
             { id: "b_support", kind: "quick_reply", label: "Talk to human", nextStepId: "" },
           ],
         },
-      ],
+      ]),
     });
+    // Only one chatbot may be active per number — pause others on the same number.
+    if (bot.status === "active") {
+      const scope = { user: req.user._id, _id: { $ne: bot._id }, status: "active" };
+      if (bot.phoneNumberId) scope.phoneNumberId = bot.phoneNumberId;
+      await WhatsAppChatbot.updateMany(scope, { $set: { status: "paused" } });
+    }
     res.status(201).json({ chatbot: bot });
   } catch (err) { next(err); }
 });
@@ -2077,6 +2086,13 @@ router.put("/chatbots/:id", async (req, res, next) => {
       { _id: req.params.id, user: req.user._id }, patch, { new: true, runValidators: true }
     );
     if (!bot) return res.status(404).json({ error: "Chatbot not found" });
+    // Single active chatbot per number: activating one pauses the rest on that
+    // same number (so it's always "manual or AI", never both, per line).
+    if (bot.status === "active") {
+      const scope = { user: req.user._id, _id: { $ne: bot._id }, status: "active" };
+      if (bot.phoneNumberId) scope.phoneNumberId = bot.phoneNumberId;
+      await WhatsAppChatbot.updateMany(scope, { $set: { status: "paused" } });
+    }
     res.json({ chatbot: bot });
   } catch (err) { next(err); }
 });

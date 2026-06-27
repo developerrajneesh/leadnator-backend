@@ -502,6 +502,58 @@ app.post("/api/leads", authRequired, ah(async (req, res) => {
   res.status(201).json({ lead });
 }));
 
+// Bulk CSV import. The client parses the CSV and posts { rows: [{name,email,phone,source}] }.
+// We validate, dedupe (by email), respect the plan's lead limit, then bulk-insert.
+app.post("/api/leads/import", authRequired, ah(async (req, res) => {
+  const { PLANS } = require("./config/plans");
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  if (!rows.length) return res.status(400).json({ error: "No rows to import" });
+
+  const plan = PLANS[req.user?.plan?.id || "starter"] || {};
+  const current = await Lead.countDocuments({ owner: req.user._id });
+  const remaining = isFinite(plan.leadLimit) ? Math.max(0, plan.leadLimit - current) : Infinity;
+
+  const existingEmails = new Set(
+    (await Lead.find({ owner: req.user._id }).select("email").lean())
+      .map((l) => String(l.email || "").toLowerCase())
+  );
+
+  let skippedInvalid = 0, skippedDuplicate = 0, skippedLimit = 0;
+  const seen = new Set();
+  const toInsert = [];
+  for (const r of rows) {
+    const name = String(r.name || r.Name || "").trim();
+    const email = String(r.email || r.Email || "").trim().toLowerCase();
+    if (!name || !email || !/^\S+@\S+\.\S+$/.test(email)) { skippedInvalid++; continue; }
+    if (existingEmails.has(email) || seen.has(email)) { skippedDuplicate++; continue; }
+    if (toInsert.length >= remaining) { skippedLimit++; continue; }
+    seen.add(email);
+    toInsert.push({
+      owner: req.user._id,
+      organization: req.tenantId || undefined,
+      name, email,
+      phone: String(r.phone || r.Phone || "").trim(),
+      source: String(r.source || r.Source || "Import").trim() || "Import",
+      status: "new",
+    });
+  }
+
+  let inserted = [];
+  if (toInsert.length) inserted = await Lead.insertMany(toInsert, { ordered: false });
+  for (const lead of inserted) {
+    flowRunner.runTrigger("trigger.new_lead", { user: req.user, lead }).catch(() => {});
+  }
+
+  res.json({
+    imported: inserted.length,
+    skipped: skippedInvalid + skippedDuplicate + skippedLimit,
+    skippedInvalid, skippedDuplicate, skippedLimit,
+    remaining: isFinite(remaining) ? Math.max(0, remaining - inserted.length) : "unlimited",
+    planLimited: skippedLimit > 0,
+    planLimit: isFinite(plan.leadLimit) ? plan.leadLimit : null,
+  });
+}));
+
 app.put("/api/leads/:id", authRequired, ah(async (req, res) => {
   const { id, ownerId, createdAt, updatedAt, owner, _id, ...rest } = req.body || {};
   const prev = await Lead.findById(req.params.id);

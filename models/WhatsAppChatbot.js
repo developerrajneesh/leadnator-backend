@@ -90,9 +90,30 @@ const schema = new mongoose.Schema(
     user:        { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
     name:        { type: String, required: true, trim: true },
     description: { type: String, default: "" },
+    // The WhatsApp number this bot answers on (one active bot per number).
+    phoneNumberId: { type: String, default: "", index: true },
+    phoneNumber:   { type: String, default: "" },   // display number, for the UI
+    // "manual" = keyword/flow bot (steps). "ai" = answers from a knowledge base.
+    type:        { type: String, enum: ["manual", "ai"], default: "manual" },
     status:      { type: String, enum: ["draft", "active", "paused"], default: "draft" },
     fallback:    { type: String, default: "Sorry, I didn't get that. Try one of the options above." },
     steps:       [stepSchema],
+
+    // AI-chatbot configuration (used when type === "ai").
+    ai: {
+      knowledgeBase: { type: String, default: "" },   // the info the AI answers from
+      greeting:      { type: String, default: "Hi 👋 How can I help you today?" },
+      tone:          { type: String, enum: ["friendly", "professional", "concise"], default: "friendly" },
+      // Only WhatsApp free-form-sendable CTAs:
+      //   url   → a "Visit website" cta_url button (one per message)
+      //   reply → a quick-reply button the customer taps (up to 3 per message)
+      ctas: [{
+        _id:   false,
+        label: { type: String, default: "" },
+        kind:  { type: String, enum: ["url", "reply"], default: "url" },
+        value: { type: String, default: "" },   // URL (for kind="url")
+      }],
+    },
     // Runtime stats
     messagesHandled: { type: Number, default: 0 },
     lastHandledAt:   { type: Date },

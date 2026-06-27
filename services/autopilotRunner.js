@@ -262,8 +262,22 @@ async function runAutopilot(ap, reqData = {}, onProgress) {
         return; // a condition is terminal on its trunk
       }
       if (node.type === "wait.delay") {
-        const ms = waitDurationMs(node.config);
-        const label = `${node.config?.amount || 0} ${node.config?.unit || "minutes"}`;
+        const cfg = node.config || {};
+        // "Wait until customer replies" — a synchronous webhook run can't block for an
+        // external reply, so we record the intent and continue. (True reply-wait needs
+        // a durable scheduler that resumes the run when a reply event arrives.)
+        if (cfg.mode === "reply") {
+          steps.push(stepOf(
+            node, "ok", clone(payload),
+            { waitFor: "reply", channel: cfg.replyChannel || "any", onTimeout: cfg.onTimeout || "continue" },
+            `Wait for customer reply${cfg.replyChannel && cfg.replyChannel !== "any" ? ` on ${cfg.replyChannel}` : ""}`,
+          ));
+          await report();
+          if (cfg.onTimeout === "stop") return { steps }; // stop here until reply support lands
+          continue;
+        }
+        const ms = waitDurationMs(cfg);
+        const label = `${cfg.amount || 0} ${cfg.unit || "minutes"}`;
         steps.push(stepOf(node, "ok", clone(payload), { waitMs: ms }, ms > 0 ? `Waiting ${label}…` : "No wait set"));
         await report();
         if (ms > 0) await sleep(ms);

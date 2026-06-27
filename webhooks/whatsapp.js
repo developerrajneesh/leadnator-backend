@@ -27,6 +27,7 @@ const LeadSettings       = require("../models/LeadSettings");
 const Lead               = require("../models/Lead");
 const { emitToUser }     = require("../services/socket");
 const { ensureWabaSubscribed } = require("../services/waSubscribe");
+const { generateText }   = require("../services/aiService");
 
 const FB_API_VERSION = process.env.META_API_VERSION || "v23.0";
 const FB_GRAPH_BASE  = `https://graph.facebook.com/${FB_API_VERSION}`;
@@ -367,8 +368,22 @@ router.post("/", async (req, res) => {
 // last step on WhatsAppContact and routing through the tapped button's
 // nextStepId when applicable.
 async function tryChatbotReply({ conn, fromPhone, text, buttonId = "" }) {
-  const bot = await WhatsAppChatbot.findOne({ user: conn.user, status: "active" }).sort({ updatedAt: -1 });
-  if (!bot) { log("no active chatbot for this user — skipping auto-reply"); return; }
+  // Prefer the active bot bound to this exact number; fall back to a legacy
+  // bot with no number set.
+  let bot = await WhatsAppChatbot.findOne({ user: conn.user, status: "active", phoneNumberId: conn.phoneNumberId }).sort({ updatedAt: -1 });
+  if (!bot) {
+    bot = await WhatsAppChatbot.findOne({
+      user: conn.user, status: "active",
+      $or: [{ phoneNumberId: "" }, { phoneNumberId: { $exists: false } }],
+    }).sort({ updatedAt: -1 });
+  }
+  if (!bot) { log("no active chatbot for this number — skipping auto-reply"); return; }
+
+  // AI chatbot: answer from the knowledge base instead of running keyword steps.
+  if (bot.type === "ai") {
+    await handleAiChatbotReply({ conn, fromPhone, text, bot });
+    return;
+  }
 
   const lower = String(text || "").trim().toLowerCase();
   const steps = bot.steps || [];
@@ -466,6 +481,84 @@ async function tryChatbotReply({ conn, fromPhone, text, buttonId = "" }) {
   WhatsAppChatbot.updateOne(
     { _id: bot._id },
     { $inc: { messagesHandled: 1 }, $set: { lastHandledAt: new Date() } }
+  ).catch(() => {});
+}
+
+// AI chatbot: generate an answer from the bot's knowledge base and reply.
+// Appends configured CTAs (one URL button as a native cta_url; phone inlined).
+async function handleAiChatbotReply({ conn, fromPhone, text, bot }) {
+  const ai = bot.ai || {};
+  let answer = "";
+  try {
+    const system = [
+      "You are a helpful WhatsApp assistant for a business.",
+      "Answer the customer's message using ONLY the knowledge base below.",
+      `If the answer is not in the knowledge base, reply with: ${bot.fallback || "Sorry, I couldn't find that — let me connect you to our team."}`,
+      `Tone: ${ai.tone || "friendly"}. Keep it short and WhatsApp-friendly — plain text, no markdown headings.`,
+      "",
+      "KNOWLEDGE BASE:",
+      ai.knowledgeBase || "(empty)",
+    ].join("\n");
+    const { content } = await generateText({ prompt: String(text || "").slice(0, 1000), system, temperature: 0.4 });
+    answer = (content || "").trim();
+  } catch (e) {
+    log("AI chatbot generate failed:", e.message);
+    answer = bot.fallback || "Sorry, I couldn't process that right now.";
+  }
+  if (!answer) answer = bot.fallback || "Sorry, I couldn't find that.";
+
+  answer = answer.slice(0, 4096);
+
+  // WhatsApp free-form CTAs: EITHER one "Visit website" (cta_url) button OR up to
+  // 3 quick-reply buttons. URL wins if present; tapping a quick-reply sends its
+  // label back, which the AI then answers.
+  const ctas = ai.ctas || [];
+  const urlCta = ctas.find((c) => c.kind === "url" && c.value && c.label);
+  const replyCtas = ctas.filter((c) => c.kind === "reply" && c.label).slice(0, 3);
+
+  let payload;
+  if (urlCta) {
+    payload = {
+      type: "interactive",
+      interactive: {
+        type: "cta_url",
+        body: { text: answer.slice(0, 1024) },
+        action: { name: "cta_url", parameters: { display_text: urlCta.label.slice(0, 20), url: urlCta.value } },
+      },
+    };
+  } else if (replyCtas.length) {
+    payload = {
+      type: "interactive",
+      interactive: {
+        type: "button",
+        body: { text: answer.slice(0, 1024) },
+        action: { buttons: replyCtas.map((c, i) => ({ type: "reply", reply: { id: `qr_${i}`, title: c.label.slice(0, 20) } })) },
+      },
+    };
+  } else {
+    payload = { type: "text", text: { body: answer, preview_url: true } };
+  }
+
+  const res = await axios.post(
+    `${FB_GRAPH_BASE}/${conn.phoneNumberId}/messages`,
+    { messaging_product: "whatsapp", to: fromPhone, ...payload },
+    { params: { access_token: conn.accessToken }, validateStatus: () => true },
+  );
+  if (res.status < 200 || res.status >= 300) {
+    log("✗ AI chatbot send failed:", res.data?.error?.message || res.status);
+    return;
+  }
+
+  const botMsg = await WhatsAppMessage.create({
+    user: conn.user, phoneNumberId: conn.phoneNumberId, contactPhone: fromPhone, direction: "outbound",
+    type: payload.type, text: answer, messageId: res.data?.messages?.[0]?.id || "", status: "sent",
+    meta: { botName: bot.name, ai: true },
+  });
+  emitToUser(conn.user, "wa.outbound", { message: botMsg.toJSON() });
+
+  WhatsAppChatbot.updateOne(
+    { _id: bot._id },
+    { $inc: { messagesHandled: 1 }, $set: { lastHandledAt: new Date() } },
   ).catch(() => {});
 }
 
