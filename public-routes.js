@@ -174,10 +174,28 @@ router.get("/google/callback", async (req, res) => {
     const decoded = googleSvc.readState(String(state));
     if (!decoded?.uid) return back("google=error&msg=Invalid+state");
 
+    // The state token can go stale (e.g. the account/workspace was recreated),
+    // pointing at IDs that no longer exist. Resolve the REAL current user + a
+    // valid org membership so the connection is stored where status reads it.
+    const OrgMembership = require("./models/OrgMembership");
+    const user = await User.findById(decoded.uid).select("_id");
+    if (!user) return back("google=error&msg=Please+log+in+again+and+retry");
+
+    let orgId = null;
+    if (decoded.org) {
+      const m = await OrgMembership.findOne({ user: user._id, organization: decoded.org });
+      if (m) orgId = m.organization;
+    }
+    if (!orgId) {
+      // Fall back to the user's primary (earliest) workspace.
+      const m = await OrgMembership.findOne({ user: user._id }).sort({ createdAt: 1 });
+      orgId = m?.organization || null;
+    }
+
     const { tokens, email } = await googleSvc.exchangeCode(String(code));
     const set = {
-      user: decoded.uid,
-      organization: decoded.org || null,
+      user: user._id,
+      organization: orgId,
       email,
       accessToken: tokens.access_token || "",
       scope: tokens.scope || "",
@@ -187,7 +205,7 @@ router.get("/google/callback", async (req, res) => {
     if (tokens.expiry_date) set.expiryDate = new Date(tokens.expiry_date);
 
     await GoogleAccount.findOneAndUpdate(
-      { user: decoded.uid, organization: decoded.org || null },
+      { user: user._id, organization: orgId },
       { $set: set },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     );

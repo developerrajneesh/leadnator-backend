@@ -1405,7 +1405,11 @@ app.get("/api/admin/revenue", authRequired, adminOnly, ah(async (_req, res) => {
   const now = new Date();
   const since = (d) => new Date(now.getTime() - d * DAY);
 
-  const activeSubs = await Subscription.find({ status: "active" }).select("amount months planName");
+  // Only REAL paid subscriptions count toward revenue (exclude free trials and
+  // admin-granted ₹0 plans).
+  const activeSubs = await Subscription
+    .find({ status: "active", amount: { $gt: 0 }, razorpayPaymentId: { $nin: ["", null] } })
+    .select("amount months planName");
   const monthlyValue = (s) => (s.months ? Math.round(s.amount / s.months) : s.amount);
   const mrr = activeSubs.reduce((sum, s) => sum + monthlyValue(s), 0);
   const arr = mrr * 12;
@@ -1512,11 +1516,19 @@ app.get("/api/admin/stats", authRequired, adminOnly, ah(async (_req, res) => {
     Ticket.find().sort({ updatedAt: -1 }).limit(5),
   ]);
 
-  const priceByName = plans.reduce((a, p) => ((a[p.name] = p.price), a), {});
   const totalUsers  = allUsers.length;
   const activeUsers = allUsers.filter((u) => u.status === "active").length;
   const pausedUsers = allUsers.filter((u) => u.status === "paused").length;
-  const mrr = allUsers.filter((u) => u.status === "active").reduce((s, u) => s + (priceByName[u.plan] || 0), 0);
+
+  // MRR = only REAL paid subscriptions (an actual Razorpay payment). Free
+  // trials and admin-granted (₹0) plans are excluded.
+  const Subscription = require("./models/Subscription");
+  const paidSubs = await Subscription
+    .find({ status: "active", amount: { $gt: 0 }, razorpayPaymentId: { $nin: ["", null] } })
+    .select("amount months user");
+  const monthlyValue = (s) => (s.months ? Math.round(s.amount / s.months) : s.amount);
+  const mrr = paidSubs.reduce((sum, s) => sum + monthlyValue(s), 0);
+  const payingUsers = new Set(paidSubs.map((s) => String(s.user))).size;
 
   // Signups for last 14 days — bucket by ISO date key.
   const signupBuckets = Array.from({ length: 14 }).map((_, i) => {
@@ -1602,7 +1614,7 @@ app.get("/api/admin/stats", authRequired, adminOnly, ah(async (_req, res) => {
   res.json({
     totals: {
       users: totalUsers, activeUsers, pausedUsers,
-      mrr, leads: allLeads.length,
+      mrr, payingUsers, leads: allLeads.length,
       openTickets, totalTickets,
       activeCampaigns, totalCampaigns,
       newThisWeek, leadsMoMPct,
