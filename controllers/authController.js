@@ -2,6 +2,7 @@ const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const TeamMember = require("../models/TeamMember");
 const { PLANS } = require("../config/plans");
+const { sendSystemEmail } = require("../services/systemEmail");
 
 function signUserToken(user) {
   return jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, {
@@ -31,6 +32,13 @@ exports.signup = async (req, res) => {
     subscriptionActive: false, trialEndsAt,
   });
   const token = signUserToken(user);
+
+  // Welcome / account-created system email (fire-and-forget).
+  sendSystemEmail("account_created", {
+    to: user.email,
+    context: { user: { name: user.name, email: user.email, phone: user.phone || "" }, trialDays },
+  });
+
   res.status(201).json({ token, user: user.toSafeJSON() });
 };
 

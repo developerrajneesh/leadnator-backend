@@ -17,11 +17,31 @@ function adminOnly(req, res, next) {
   next();
 }
 
-// Human-friendly ticket code like "T-1042". Uses doc count so it stays
-// monotonic and readable without pulling a counter collection.
+// Human-friendly ticket code like "T-1042". Based on the highest existing
+// numeric code (not the doc count) so it never collides when tickets are
+// deleted — and the caller retries on the rare concurrent-insert clash.
 async function nextTicketCode() {
-  const n = await Ticket.countDocuments();
-  return `T-${1000 + n + 1}`;
+  const agg = await Ticket.aggregate([
+    { $match: { code: { $regex: /^T-\d+$/ } } },
+    { $addFields: { num: { $toInt: { $arrayElemAt: [{ $split: ["$code", "-"] }, 1] } } } },
+    { $group: { _id: null, max: { $max: "$num" } } },
+  ]);
+  const max = agg[0]?.max || 1000;
+  return `T-${max + 1}`;
+}
+
+// Create a ticket, retrying on a duplicate-code race (E11000 on `code`).
+async function createTicketWithCode(data) {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      return await Ticket.create({ ...data, code: await nextTicketCode() });
+    } catch (err) {
+      if (err?.code === 11000 && err?.keyPattern?.code) continue; // collided — try again
+      throw err;
+    }
+  }
+  // Last resort — make the code unique with a short random suffix.
+  return Ticket.create({ ...data, code: `T-${Date.now().toString().slice(-6)}` });
 }
 
 /* ============================================================
@@ -49,9 +69,7 @@ router.post("/tickets", ah(async (req, res) => {
   const { subject, description = "", category = "General", priority = "medium" } = req.body || {};
   if (!subject?.trim()) return res.status(400).json({ error: "Subject is required" });
 
-  const code = await nextTicketCode();
-  const ticket = await Ticket.create({
-    code,
+  const ticket = await createTicketWithCode({
     owner: req.user._id,
     user: req.user.name,
     userEmail: req.user.email || "",

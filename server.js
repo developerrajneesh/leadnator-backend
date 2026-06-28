@@ -304,35 +304,20 @@ app.post("/api/auth/forgot-password", ah(async (req, res) => {
     const appUrl = (process.env.CLIENT_URL || "http://localhost:5173").replace(/\/$/, "");
     const resetLink = `${appUrl}/reset-password/${rawToken}`;
 
-    // Send via Amazon SES (see services/mailer.js). If SES isn't configured,
-    // log the link so devs can copy-paste it during local testing.
-    const { sendSystemMail, getMailer } = require("./services/mailer");
-    if (getMailer()) {
-      try {
-        await sendSystemMail({
-          to: email,
-          subject: "Reset your Leadnator password",
-          html: `
-            <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:20px;color:#111">
-              <h2 style="color:#7c3aed;margin:0 0 16px">Reset your password</h2>
-              <p>Hi ${user.name || "there"}, click the button below to set a new password. This link expires in 1 hour.</p>
-              <p style="margin:24px 0;text-align:center">
-                <a href="${resetLink}" style="background:#7c3aed;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block">Reset password</a>
-              </p>
-              <p style="font-size:12px;color:#6b7280">Or copy this link into your browser:<br/>
-                <a href="${resetLink}" style="color:#7c3aed;word-break:break-all">${resetLink}</a>
-              </p>
-              <p style="font-size:12px;color:#6b7280;margin-top:24px">If you didn't request this, you can ignore this email — your password won't change.</p>
-            </div>
-          `,
-        });
-        console.log(`[auth] password reset email sent to ${email}`);
-      } catch (err) {
-        console.warn(`[auth] failed to send reset email: ${err.message}. Reset link: ${resetLink}`);
+    // Send the (admin-editable) password-reset system email via Resend/SES.
+    try {
+      const { sendSystemEmail } = require("./services/systemEmail");
+      const r = await sendSystemEmail("password_reset", {
+        to: email,
+        context: { user: { name: user.name || "there", email: user.email, phone: user.phone || "" }, resetLink },
+      });
+      if (r.skipped) {
+        console.log(`\n[auth] PASSWORD RESET for ${email}\n  Link: ${resetLink}\n  (Set RESEND_API_KEY in backend/.env to email it instead)\n`);
+      } else {
+        console.log(`[auth] password reset email sent to ${email} (${r.provider || "?"})`);
       }
-    } else {
-      // No SES configured — surface the link in the console for dev.
-      console.log(`\n[auth] PASSWORD RESET for ${email}\n  Link: ${resetLink}\n  (Configure AWS_REGION / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in backend/.env to email it instead)\n`);
+    } catch (err) {
+      console.warn(`[auth] failed to send reset email: ${err.message}. Reset link: ${resetLink}`);
     }
   }
 
@@ -1194,8 +1179,17 @@ app.put("/api/admin/users/:id", authRequired, adminOnly, ah(async (req, res) => 
     rest.trialEndsAt = null;
   }
 
+  const prevStatus = user.status;
   Object.assign(user, rest);
   await user.save();
+
+  // Suspend / reactivate system emails (fire-and-forget).
+  if (rest.status && rest.status !== prevStatus) {
+    const { sendSystemEmail } = require("./services/systemEmail");
+    const ctx = { user: { name: user.name, email: user.email, phone: user.phone || "" } };
+    if (rest.status === "suspended") sendSystemEmail("account_blocked", { to: user.email, context: ctx });
+    else if (prevStatus === "suspended" && rest.status === "active") sendSystemEmail("account_unblocked", { to: user.email, context: ctx });
+  }
 
   // Return the user + its active subscription summary.
   const sub = await Subscription.findOne({ user: user._id, status: "active" }).sort({ createdAt: -1 });
@@ -1208,6 +1202,60 @@ app.delete("/api/admin/users/:id", authRequired, adminOnly, ah(async (req, res) 
   if (target.role === "admin") return res.status(400).json({ error: "Cannot delete admin" });
   await target.deleteOne();
   res.json({ deleted: req.params.id });
+}));
+
+// ---------- Admin: system-email templates ----------
+app.get("/api/admin/email-templates", authRequired, adminOnly, ah(async (_req, res) => {
+  const SystemEmailTemplate = require("./models/SystemEmailTemplate");
+  const { ensureSystemEmailTemplates } = require("./services/systemEmail");
+  const { SYSTEM_EMAILS } = require("./config/systemEmails");
+  await ensureSystemEmailTemplates();
+  const rows = await SystemEmailTemplate.find().lean();
+  const byKey = Object.fromEntries(rows.map((r) => [r.key, r]));
+  // Return in the canonical order, with the available variables for the editor.
+  const templates = SYSTEM_EMAILS.map((d) => ({ ...byKey[d.key], vars: d.vars, name: byKey[d.key]?.name || d.name, description: byKey[d.key]?.description || d.description }));
+  res.json({ templates });
+}));
+
+app.put("/api/admin/email-templates/:key", authRequired, adminOnly, ah(async (req, res) => {
+  const SystemEmailTemplate = require("./models/SystemEmailTemplate");
+  const { subject, html, enabled } = req.body || {};
+  const set = {};
+  if (subject != null) set.subject = String(subject);
+  if (html != null) set.html = String(html);
+  if (enabled != null) set.enabled = !!enabled;
+  const row = await SystemEmailTemplate.findOneAndUpdate({ key: req.params.key }, { $set: set }, { new: true });
+  if (!row) return res.status(404).json({ error: "Template not found" });
+  res.json({ template: row.toJSON() });
+}));
+
+app.post("/api/admin/email-templates/:key/reset", authRequired, adminOnly, ah(async (req, res) => {
+  const SystemEmailTemplate = require("./models/SystemEmailTemplate");
+  const { defaultByKey } = require("./config/systemEmails");
+  const def = defaultByKey(req.params.key);
+  if (!def) return res.status(404).json({ error: "Unknown template" });
+  const row = await SystemEmailTemplate.findOneAndUpdate(
+    { key: req.params.key },
+    { $set: { subject: def.subject, html: def.html, name: def.name, description: def.description } },
+    { new: true, upsert: true }
+  );
+  res.json({ template: row.toJSON() });
+}));
+
+app.post("/api/admin/email-templates/:key/test", authRequired, adminOnly, ah(async (req, res) => {
+  const { sendSystemEmail } = require("./services/systemEmail");
+  const to = (req.body?.to || req.user.email || "").trim();
+  if (!to) return res.status(400).json({ error: "No recipient" });
+  // Sample context so {{variables}} render in the test.
+  const sample = {
+    user: { name: req.user.name || "Test User", email: to, phone: "+91 90000 00000" },
+    trialDays: 2, resetLink: `${(process.env.CLIENT_URL || "http://localhost:5173")}/reset-password/sample`,
+    plan: { name: "Pro" }, amount: 1999, months: 1,
+    expiresAt: new Date(Date.now() + 30 * 86400000).toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" }),
+    booking: { title: "Demo call", when: "Mon, 1 Jul 2026, 3:00 PM", host: "Your Team", meetLink: "https://meet.google.com/sample" },
+  };
+  const r = await sendSystemEmail(req.params.key, { to, context: sample });
+  res.json(r);
 }));
 
 // Rich per-user detail for the admin user-detail page (tabs: overview, leads,
@@ -1594,6 +1642,17 @@ connectDB()
       await LeadSettings.syncIndexes();
     } catch (e) {
       console.warn("[migrate] leadsettings index fix skipped:", e.message);
+    }
+
+    // Seed the system-email templates (idempotent) + start the subscription
+    // expiry-reminder scheduler.
+    try {
+      const { ensureSystemEmailTemplates } = require("./services/systemEmail");
+      await ensureSystemEmailTemplates();
+      const { startSubscriptionReminders } = require("./services/subscriptionReminders");
+      startSubscriptionReminders();
+    } catch (e) {
+      console.warn("[boot] system-email setup skipped:", e.message);
     }
 
     const server = http.createServer(app);

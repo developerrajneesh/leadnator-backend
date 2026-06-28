@@ -162,8 +162,10 @@ router.get("/plans", async (_req, res, next) => {
 
 // ---------- GOOGLE OAUTH CALLBACK (public — Google redirects here) ----------
 router.get("/google/callback", async (req, res) => {
-  const clientUrl = (process.env.CLIENT_URL || "http://localhost:5173").replace(/\/$/, "");
-  const back = (q) => res.redirect(`${clientUrl}/calendar/availability?${q}`);
+  // Redirect back to the APP (prefer APP_URL, then CLIENT_URL). The Month/Week
+  // calendar views read ?google=… and show the connected/synced state + toast.
+  const clientUrl = (process.env.APP_URL || process.env.CLIENT_URL || "http://localhost:5173").replace(/\/$/, "");
+  const back = (q) => res.redirect(`${clientUrl}/calendar/month?${q}`);
   try {
     const { code, state, error } = req.query;
     if (error) return back(`google=error&msg=${encodeURIComponent(String(error))}`);
@@ -293,18 +295,15 @@ router.post("/booking/:bookingTypeId", async (req, res, next) => {
     // Branded confirmation email (best-effort). Google also sends its own invite.
     const avail = await Availability.findOne({ user: bt.user, organization: bt.organization || null });
     const whenStr = fmtWhen(slotDate, avail?.timezone);
-    const meetRow = meetLink
-      ? `<p style="margin:8px 0"><strong>Join link:</strong> <a href="${meetLink}" style="color:#7c3aed">${meetLink}</a></p>`
-      : "";
-    await sendMail(email, `Booking confirmed: ${bt.name}`, `
-      <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:20px;color:#111">
-        <h2 style="color:#7c3aed;margin:0 0 12px">You're booked! 🎉</h2>
-        <p>Hi ${name}, your <strong>${bt.name}</strong> is confirmed.</p>
-        <p style="margin:8px 0"><strong>When:</strong> ${whenStr}</p>
-        ${meetRow}
-        ${notes ? `<p style="margin:8px 0"><strong>Notes:</strong> ${notes}</p>` : ""}
-        <p style="font-size:12px;color:#6b7280;margin-top:18px">A calendar invite has also been sent to your email.</p>
-      </div>`);
+    const hostUser = await User.findById(bt.user).select("name").lean().catch(() => null);
+    const { sendSystemEmail } = require("./services/systemEmail");
+    await sendSystemEmail("booking_confirmed", {
+      to: email,
+      context: {
+        user: { name, email },
+        booking: { title: bt.name, when: whenStr, host: hostUser?.name || "your host", meetLink: meetLink || "" },
+      },
+    });
 
     res.status(201).json({ booking, bookingType: bt.toJSON(), meetLink });
   } catch (err) { next(err); }

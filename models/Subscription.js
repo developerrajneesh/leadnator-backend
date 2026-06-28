@@ -18,6 +18,10 @@ const subscriptionSchema = new mongoose.Schema(
     startedAt:  { type: Date, default: Date.now },
     expiresAt:  { type: Date },
     cancelledAt:{ type: Date },
+
+    // Expiry-reminder system emails (set once each so we never double-send).
+    remind2dSentAt: { type: Date, default: null },
+    remind5hSentAt: { type: Date, default: null },
   },
   {
     timestamps: true,

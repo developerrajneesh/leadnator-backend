@@ -165,8 +165,38 @@ router.post("/verify", async (req, res, next) => {
       paidAt: startedAt,
     });
 
+    // Payment-success system email (fire-and-forget).
+    try {
+      const { sendSystemEmail } = require("./services/systemEmail");
+      sendSystemEmail("payment_success", {
+        to: req.user.email,
+        context: {
+          user: { name: req.user.name, email: req.user.email, phone: req.user.phone || "" },
+          plan: { name: sub.planName }, amount: sub.amount, months: sub.months,
+          expiresAt: new Date(expiresAt).toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" }),
+        },
+      });
+    } catch { /* non-fatal */ }
+
     res.json({ verified: true, subscription: sub.toJSON(), invoice });
   } catch (err) { next(err); }
+});
+
+// ---------- Payment failed (called by the client when Razorpay reports failure) ----------
+router.post("/payment-failed", async (req, res) => {
+  try {
+    const { planKey = "", amount = 0 } = req.body || {};
+    const plan = planKey ? await Plan.findOne({ key: planKey }) : null;
+    const { sendSystemEmail } = require("./services/systemEmail");
+    await sendSystemEmail("payment_failed", {
+      to: req.user.email,
+      context: {
+        user: { name: req.user.name, email: req.user.email, phone: req.user.phone || "" },
+        plan: { name: plan?.name || "your" }, amount: amount || plan?.price || 0,
+      },
+    });
+    res.json({ ok: true });
+  } catch (err) { res.json({ ok: false, error: err.message }); }
 });
 
 // ---------- Current subscription ----------
