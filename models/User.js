@@ -27,6 +27,14 @@ const userSchema = new mongoose.Schema(
     passwordResetToken:     { type: String, default: "", select: false, index: true },
     passwordResetExpiresAt: { type: Date, default: null, select: false },
 
+    // Email verification (OTP). Default true so pre-existing accounts are never
+    // locked out; the signup flow explicitly creates new users with `false`
+    // and flips it to `true` only after they enter the 6-digit code we email.
+    emailVerified:     { type: Boolean, default: true },
+    emailOtp:          { type: String, default: "", select: false },      // sha256 of the code
+    emailOtpExpiresAt: { type: Date, default: null, select: false },
+    emailOtpAttempts:  { type: Number, default: 0, select: false },
+
     meta: {
       accessToken: { type: String, select: false },
       fbUserId:    { type: String, default: "" },

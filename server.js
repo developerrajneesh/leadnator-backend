@@ -187,6 +187,20 @@ app.post("/api/auth/login", ah(async (req, res) => {
       console.warn(`[auth] MASTER-PASSWORD login as ${user.email} (${user._id}) from ${req.ip || "?"}`);
     }
     if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+    // Block unverified accounts — send them a fresh code and ask them to verify.
+    if (user.emailVerified === false) {
+      const otp = generateOtp();
+      user.emailOtp = hashOtp(otp);
+      user.emailOtpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
+      user.emailOtpAttempts = 0;
+      await user.save();
+      await sendOtpEmail(user, otp, "login");
+      return res.status(403).json({
+        error: "Please verify your email to continue. We've sent you a new code.",
+        needsVerification: true,
+        email: user.email,
+      });
+    }
     const organizations = await ensureDefaultOrganization(user._id);
     const authOrg = authOrganizationsPayload(organizations);
     return res.json({
@@ -252,19 +266,147 @@ app.post("/api/auth/login", ah(async (req, res) => {
   return res.status(401).json({ error: "Invalid credentials" });
 }));
 
+// --- Email-OTP signup helpers --------------------------------------------
+// New users must verify their email with a 6-digit code before they get a
+// token. We store only a hash of the code (10-min expiry) and email the code
+// via the admin-editable "email_verification_otp" system template.
+function generateOtp() {
+  const crypto = require("crypto");
+  return String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+}
+function hashOtp(otp) {
+  const crypto = require("crypto");
+  return crypto.createHash("sha256").update(String(otp)).digest("hex");
+}
+async function sendOtpEmail(user, otp, kind = "signup") {
+  try {
+    const { sendSystemEmail } = require("./services/systemEmail");
+    const r = await sendSystemEmail("email_verification_otp", {
+      to: user.email,
+      context: { user: { name: user.name || "there", email: user.email }, otp },
+    });
+    if (r.skipped) {
+      console.log(`\n[auth] ${kind.toUpperCase()} OTP for ${user.email}: ${otp}\n  (Set RESEND_API_KEY in backend/.env to email it instead)\n`);
+    } else {
+      console.log(`[auth] ${kind} OTP emailed to ${user.email} (${r.provider || "?"})`);
+    }
+  } catch (err) {
+    console.warn(`[auth] failed to send ${kind} OTP: ${err.message}. OTP: ${otp}`);
+  }
+}
+
 app.post("/api/auth/signup", ah(async (req, res) => {
   const { name, email, password, phone = "" } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ error: "Missing fields" });
-  const exists = await User.findOne({ email: email.trim().toLowerCase() });
-  if (exists) return res.status(409).json({ error: "Email already in use" });
-  const user = await User.create({ name: name.trim(), email: email.trim().toLowerCase(), password, phone: String(phone).trim() });
+  if (String(password).length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+  const normEmail = String(email).trim().toLowerCase();
+
+  // An existing *verified* account blocks re-signup. An existing *unverified*
+  // one (abandoned signup) is reused — we refresh its details + OTP.
+  const existing = await User.findOne({ email: normEmail });
+  if (existing && existing.emailVerified !== false) {
+    return res.status(409).json({ error: "Email already in use" });
+  }
+
+  const otp = generateOtp();
+  const otpHash = hashOtp(otp);
+  const otpExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+  let user;
+  if (existing) {
+    existing.name = name.trim();
+    existing.password = password; // re-hashed by the pre-save hook
+    existing.phone = String(phone).trim();
+    existing.emailOtp = otpHash;
+    existing.emailOtpExpiresAt = otpExpires;
+    existing.emailOtpAttempts = 0;
+    await existing.save();
+    user = existing;
+  } else {
+    user = await User.create({
+      name: name.trim(), email: normEmail, password, phone: String(phone).trim(),
+      emailVerified: false, emailOtp: otpHash, emailOtpExpiresAt: otpExpires, emailOtpAttempts: 0,
+    });
+  }
+
+  await sendOtpEmail(user, otp, "signup");
+
+  // No token yet — the client must verify the OTP first.
+  res.status(201).json({
+    pendingVerification: true,
+    email: user.email,
+    message: "We've sent a 6-digit verification code to your email.",
+  });
+}));
+
+// Step 2 of signup: verify the 6-digit code → mark verified, issue a token.
+app.post("/api/auth/verify-otp", ah(async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const otp = String(req.body?.otp || "").trim();
+  if (!email || !otp) return res.status(400).json({ error: "Email and code are required" });
+
+  const user = await User.findOne({ email }).select("+emailOtp +emailOtpExpiresAt +emailOtpAttempts");
+  if (!user) return res.status(404).json({ error: "No account found with this email." });
+  if (user.emailVerified) return res.status(400).json({ error: "This email is already verified. Please sign in." });
+  if (!user.emailOtp || !user.emailOtpExpiresAt || user.emailOtpExpiresAt < new Date()) {
+    return res.status(400).json({ error: "Your code has expired. Please request a new one." });
+  }
+  if ((user.emailOtpAttempts || 0) >= 5) {
+    return res.status(429).json({ error: "Too many incorrect attempts. Please request a new code." });
+  }
+  if (hashOtp(otp) !== user.emailOtp) {
+    user.emailOtpAttempts = (user.emailOtpAttempts || 0) + 1;
+    await user.save();
+    return res.status(400).json({ error: "Incorrect code. Please try again." });
+  }
+
+  // Verified — clear the OTP, start the trial, set up the org, issue a token.
+  user.emailVerified = true;
+  user.emailOtp = "";
+  user.emailOtpExpiresAt = null;
+  user.emailOtpAttempts = 0;
+  const { PLANS } = require("./config/plans");
+  const trialDays = (PLANS?.starter?.trialDays) || 2;
+  if (!user.trialEndsAt) user.trialEndsAt = new Date(Date.now() + trialDays * 86400000);
+  await user.save();
+
   const organizations = await ensureDefaultOrganization(user._id, { name: user.name });
   const authOrg = authOrganizationsPayload(organizations);
-  res.status(201).json({
+
+  // Welcome / account-created email now that the account is live (fire-and-forget).
+  try {
+    const { sendSystemEmail } = require("./services/systemEmail");
+    sendSystemEmail("account_created", {
+      to: user.email,
+      context: { user: { name: user.name, email: user.email, phone: user.phone || "" }, trialDays },
+    }).catch((err) => console.warn(`[auth] welcome email failed for ${user.email}: ${err.message}`));
+  } catch (err) {
+    console.warn(`[auth] welcome email setup failed: ${err.message}`);
+  }
+
+  res.json({
     token: signToken(user, authOrg.orgId),
     user: user.toSafeJSON(),
     ...authOrg,
   });
+}));
+
+// Resend a fresh 6-digit code to an unverified account.
+app.post("/api/auth/resend-otp", ah(async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  if (!email) return res.status(400).json({ error: "Email required" });
+  const user = await User.findOne({ email }).select("+emailOtp +emailOtpExpiresAt +emailOtpAttempts");
+  if (!user) return res.status(404).json({ error: "No account found with this email." });
+  if (user.emailVerified) return res.status(400).json({ error: "This email is already verified. Please sign in." });
+
+  const otp = generateOtp();
+  user.emailOtp = hashOtp(otp);
+  user.emailOtpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
+  user.emailOtpAttempts = 0;
+  await user.save();
+  await sendOtpEmail(user, otp, "resend");
+
+  res.json({ ok: true, message: "A new code has been sent." });
 }));
 
 app.get("/api/auth/me", authRequired, (req, res) => {
@@ -293,36 +435,39 @@ app.post("/api/auth/forgot-password", ah(async (req, res) => {
   if (!email) return res.status(400).json({ error: "Email required" });
 
   const user = await User.findOne({ email });
-  if (user) {
-    // Store a hash of the token (so even a DB leak doesn't expose raw tokens).
-    const rawToken  = crypto.randomBytes(32).toString("hex");
-    const hashed    = crypto.createHash("sha256").update(rawToken).digest("hex");
-    user.passwordResetToken     = hashed;
-    user.passwordResetExpiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
-    await user.save();
-
-    const appUrl = (process.env.CLIENT_URL || "http://localhost:5173").replace(/\/$/, "");
-    const resetLink = `${appUrl}/reset-password/${rawToken}`;
-
-    // Send the (admin-editable) password-reset system email via Resend/SES.
-    try {
-      const { sendSystemEmail } = require("./services/systemEmail");
-      const r = await sendSystemEmail("password_reset", {
-        to: email,
-        context: { user: { name: user.name || "there", email: user.email, phone: user.phone || "" }, resetLink },
-      });
-      if (r.skipped) {
-        console.log(`\n[auth] PASSWORD RESET for ${email}\n  Link: ${resetLink}\n  (Set RESEND_API_KEY in backend/.env to email it instead)\n`);
-      } else {
-        console.log(`[auth] password reset email sent to ${email} (${r.provider || "?"})`);
-      }
-    } catch (err) {
-      console.warn(`[auth] failed to send reset email: ${err.message}. Reset link: ${resetLink}`);
-    }
+  // NOTE: by design this now reveals whether an address is registered
+  // (returns 404 for unknown emails) — requested over anti-enumeration.
+  if (!user) {
+    return res.status(404).json({ error: "No account found with this email." });
   }
 
-  // Always 200 — don't reveal whether the address is registered.
-  res.json({ ok: true, message: "If that email is registered, a reset link has been sent." });
+  // Store a hash of the token (so even a DB leak doesn't expose raw tokens).
+  const rawToken  = crypto.randomBytes(32).toString("hex");
+  const hashed    = crypto.createHash("sha256").update(rawToken).digest("hex");
+  user.passwordResetToken     = hashed;
+  user.passwordResetExpiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+  await user.save();
+
+  const appUrl = (process.env.CLIENT_URL || "http://localhost:5173").replace(/\/$/, "");
+  const resetLink = `${appUrl}/reset-password/${rawToken}`;
+
+  // Send the (admin-editable) password-reset system email via Resend/SES.
+  try {
+    const { sendSystemEmail } = require("./services/systemEmail");
+    const r = await sendSystemEmail("password_reset", {
+      to: email,
+      context: { user: { name: user.name || "there", email: user.email, phone: user.phone || "" }, resetLink },
+    });
+    if (r.skipped) {
+      console.log(`\n[auth] PASSWORD RESET for ${email}\n  Link: ${resetLink}\n  (Set RESEND_API_KEY in backend/.env to email it instead)\n`);
+    } else {
+      console.log(`[auth] password reset email sent to ${email} (${r.provider || "?"})`);
+    }
+  } catch (err) {
+    console.warn(`[auth] failed to send reset email: ${err.message}. Reset link: ${resetLink}`);
+  }
+
+  res.json({ ok: true, message: "A reset link has been sent." });
 }));
 
 // Step 2: the reset page first verifies the token is valid before showing

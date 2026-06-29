@@ -314,21 +314,36 @@ class ClickToCallService {
         
         console.log('📹 Creating Call video ad creative');
       } else {
-        // For image ads, use link_data
-        objectStorySpec = {
-          page_id: creativeData.page_id,
-          link_data: {
-            picture: creativeData.picture_url,
-            link: creativeData.business_page_url,
-            call_to_action: {
-              type: 'CALL_NOW',
-              value: {
-                link: `tel:${creativeData.phone_number}`
-              }
+        // For image ads, use link_data. Prefer a Meta image_hash (uploaded to
+        // Meta); fall back to a hosted picture URL if that's what was provided.
+        const linkData = {
+          link: creativeData.business_page_url,
+          message: creativeData.primary_text || "",
+          call_to_action: {
+            type: 'CALL_NOW',
+            value: {
+              link: `tel:${creativeData.phone_number}`
             }
           }
         };
-        
+        if (creativeData.headline && creativeData.headline.trim()) {
+          linkData.name = creativeData.headline.trim();
+        }
+        if (creativeData.description && creativeData.description.trim()) {
+          linkData.description = creativeData.description.trim();
+        }
+        if (creativeData.image_hash) {
+          linkData.image_hash = creativeData.image_hash;
+          console.log('✅ Using image_hash for image creative:', creativeData.image_hash);
+        } else if (creativeData.picture_url) {
+          linkData.picture = creativeData.picture_url;
+          console.log('✅ Using picture URL for image creative:', creativeData.picture_url);
+        }
+        objectStorySpec = {
+          page_id: creativeData.page_id,
+          link_data: linkData
+        };
+
         console.log('🖼️ Creating Call image ad creative');
       }
       
@@ -355,18 +370,27 @@ class ClickToCallService {
 
       return response.data;
     } catch (error) {
-      const errorMessage = error.response?.data?.error?.message || error.message || 'Failed to create ad creative';
       const errorDetails = error.response?.data?.error || {};
-      
+      // Prefer Meta's human-readable reason (error_user_msg) over the generic
+      // "Invalid parameter" so the UI tells the user what's actually wrong.
+      const errorMessage =
+        errorDetails.error_user_msg ||
+        errorDetails.error_user_title ||
+        errorDetails.message ||
+        error.message ||
+        'Failed to create ad creative';
+
       console.error('Meta API Error Details:', {
         message: errorMessage,
         type: errorDetails.type,
         code: errorDetails.code,
         error_subcode: errorDetails.error_subcode,
+        error_user_title: errorDetails.error_user_title,
+        error_user_msg: errorDetails.error_user_msg,
         fbtrace_id: errorDetails.fbtrace_id,
         fullError: JSON.stringify(error.response?.data, null, 2)
       });
-      
+
       throw new Error(`${errorMessage}${errorDetails.code ? ` (Code: ${errorDetails.code})` : ''}`);
     }
   }

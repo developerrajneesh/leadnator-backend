@@ -2278,27 +2278,24 @@ exports.getTargetingSearch = async (req, res, next) => {
     if (!q || !type) {
       throw Object.assign(
         new Error(
-          "Missing required query parameters: q (search query) and type (adgeolocation)"
+          "Missing required query parameters: q (search query) and type"
         ),
         { status: 400 }
       );
     }
 
-    // Meta API uses 'adgeolocation' type for both regions and cities
-    // The location_class parameter can be used to filter: 'region' or 'city'
-    const params = {
-      q: q,
-      type: "adgeolocation",
-      limit: 50,
-    };
+    // Detailed-targeting search types map straight to Meta's search `type`.
+    const detailedTypes = ["adinterest", "adworkposition", "adworkemployer", "adlocale", "adeducationschool", "adeducationmajor"];
 
-    if (country_code) {
-      params.country_code = country_code;
-    }
+    const params = { q, limit: 50 };
 
-    // Add location_class if specified (region or city)
-    if (type === "region" || type === "city") {
-      params.location_class = type;
+    if (detailedTypes.includes(type)) {
+      params.type = type;
+    } else {
+      // Geolocation search: Meta uses 'adgeolocation' for regions/cities.
+      params.type = "adgeolocation";
+      if (country_code) params.country_code = country_code;
+      if (type === "region" || type === "city") params.location_class = type;
     }
 
     const data = await fbRequest({
@@ -2308,7 +2305,8 @@ exports.getTargetingSearch = async (req, res, next) => {
       accessToken,
     });
 
-    res.json({ success: true, data: data });
+    // FB returns { data: [...] }. Normalize so the frontend always gets an array.
+    res.json({ success: true, data: data?.data || data || [] });
   } catch (err) {
     return handleError(err, res, next);
   }

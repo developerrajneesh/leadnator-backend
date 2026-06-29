@@ -141,6 +141,15 @@ router.delete("/:id", async (req, res, next) => {
     const org = await Organization.findById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
+    // Keep at least one organization — refuse to delete the last active one.
+    const activeCount = await Organization.countDocuments({
+      createdBy: org.createdBy,
+      status: { $ne: "archived" },
+    });
+    if (activeCount <= 1) {
+      return res.status(400).json({ error: "You must keep at least one organization." });
+    }
+
     org.status = "archived";
     await org.save();
 

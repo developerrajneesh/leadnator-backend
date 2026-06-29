@@ -192,7 +192,10 @@ router.get("/google/callback", async (req, res) => {
       orgId = m?.organization || null;
     }
 
-    const { tokens, email } = await googleSvc.exchangeCode(String(code));
+    // Exchange against the SAME redirect_uri used at the authorize step
+    // (stashed in the signed state) — Google requires an exact match.
+    const redirectOverride = googleSvc.sanitizeRedirectUri(decoded.r);
+    const { tokens, email } = await googleSvc.exchangeCode(String(code), redirectOverride);
     const set = {
       user: user._id,
       organization: orgId,

@@ -43,6 +43,19 @@ const SYSTEM_EMAILS = [
     ),
   },
   {
+    key: "email_verification_otp",
+    name: "Email verification code (OTP)",
+    description: "Sent during signup to verify the user's email with a 6-digit code.",
+    vars: ["user.name", "user.email", "otp", "appUrl"],
+    subject: "Your Leadnator verification code: {{otp}}",
+    html: layout(
+      h2("Verify your email") +
+      p("Hi {{user.name}}, use the code below to verify your email and finish setting up your Leadnator account.") +
+      `<p style="margin:24px 0;text-align:center"><span style="display:inline-block;font-size:34px;font-weight:800;letter-spacing:10px;color:#7c3aed;background:#f5f3ff;border:1px solid #ede9fe;border-radius:12px;padding:14px 10px 14px 20px">{{otp}}</span></p>` +
+      p("This code expires in 10 minutes. If you didn't create a Leadnator account, you can safely ignore this email.")
+    ),
+  },
+  {
     key: "password_reset",
     name: "Password reset",
     description: "Sent when a user requests a password reset.",

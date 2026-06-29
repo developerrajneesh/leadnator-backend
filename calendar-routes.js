@@ -35,8 +35,12 @@ router.get("/google/connect", (req, res, next) => {
     if (!googleSvc.isConfigured()) {
       return res.status(400).json({ error: "Google isn't configured on the server. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in backend/.env." });
     }
-    const state = googleSvc.makeState(req.user._id, req.tenantId || null);
-    res.json({ url: googleSvc.authUrl(state) });
+    // The frontend passes its own callback URL (derived from VITE_API_URL) so a
+    // single env var drives the redirect across local/production. We validate it
+    // and fall back to the server default if it's missing/invalid.
+    const redirect = googleSvc.sanitizeRedirectUri(req.query.redirectUri);
+    const state = googleSvc.makeState(req.user._id, req.tenantId || null, redirect);
+    res.json({ url: googleSvc.authUrl(state, redirect) });
   } catch (err) { next(err); }
 });
 

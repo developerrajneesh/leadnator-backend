@@ -36,23 +36,46 @@ function redirectUri() {
   return `${apiBase}/api/public/google/callback`;
 }
 
-function oauthClient() {
+// Accept a client-supplied redirect URI (derived from the frontend's
+// VITE_API_URL) only if it's a well-formed http(s) URL pointing at OUR own
+// callback path. This lets a single env var (VITE_API_URL) move the whole
+// OAuth flow between local and production. Anything else → null, and we fall
+// back to the server default. Google still enforces that the final URI is one
+// registered in the Cloud Console, so this can't be abused as an open redirect.
+function sanitizeRedirectUri(uri) {
+  if (!uri) return null;
+  try {
+    const u = new URL(String(uri));
+    if (!/^https?:$/.test(u.protocol)) return null;
+    if (u.pathname.replace(/\/$/, "") !== "/api/public/google/callback") return null;
+    return u.origin + u.pathname.replace(/\/$/, "");
+  } catch { return null; }
+}
+
+function oauthClient(redirectOverride) {
   return new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
-    redirectUri(),
+    redirectOverride || redirectUri(),
   );
 }
 
-function makeState(userId, orgId) {
-  return jwt.sign({ uid: String(userId), org: orgId ? String(orgId) : null }, JWT_SECRET, { expiresIn: "1h" });
+// `redirect` is stashed in the signed state so the callback exchanges the code
+// against the EXACT same redirect_uri used at the authorize step (Google
+// requires them to match).
+function makeState(userId, orgId, redirect) {
+  return jwt.sign(
+    { uid: String(userId), org: orgId ? String(orgId) : null, r: redirect || null },
+    JWT_SECRET,
+    { expiresIn: "1h" },
+  );
 }
 function readState(state) {
   try { return jwt.verify(state, JWT_SECRET); } catch { return null; }
 }
 
-function authUrl(state) {
-  return oauthClient().generateAuthUrl({
+function authUrl(state, redirectOverride) {
+  return oauthClient(redirectOverride).generateAuthUrl({
     access_type: "offline",   // needed to get a refresh token
     prompt: "consent",        // force refresh_token on every connect
     include_granted_scopes: true,
@@ -61,8 +84,8 @@ function authUrl(state) {
   });
 }
 
-async function exchangeCode(code) {
-  const client = oauthClient();
+async function exchangeCode(code, redirectOverride) {
+  const client = oauthClient(redirectOverride);
   const { tokens } = await client.getToken(code);
   client.setCredentials(tokens);
   let email = "";
@@ -136,6 +159,7 @@ async function createMeetEvent(account, { summary, description, startISO, endISO
 module.exports = {
   isConfigured,
   redirectUri,
+  sanitizeRedirectUri,
   SCOPES,
   authUrl,
   makeState,
