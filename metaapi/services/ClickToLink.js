@@ -303,18 +303,25 @@ class ClickToLinkService {
         
         console.log('📹 Creating Link video ad creative');
       } else {
-        // For image ads, use link_data
+        // For image ads, use link_data. Prefer a Meta image_hash (uploaded to
+        // Meta); fall back to a hosted picture URL.
+        const linkData = {
+          link: creativeData.link_url || creativeData.business_page_url,
+          message: creativeData.message || creativeData.primary_text || '',
+          name: creativeData.headline || '',
+          description: creativeData.description || ''
+        };
+        if (creativeData.image_hash) {
+          linkData.image_hash = creativeData.image_hash;
+          console.log('✅ Using image_hash for image creative:', creativeData.image_hash);
+        } else if (creativeData.picture_url) {
+          linkData.picture = creativeData.picture_url;
+        }
         objectStorySpec = {
           page_id: creativeData.page_id,
-          link_data: {
-            picture: creativeData.picture_url,
-            link: creativeData.link_url || creativeData.business_page_url,
-            message: creativeData.message || creativeData.primary_text || '',
-            name: creativeData.headline || '',
-            description: creativeData.description || ''
-          }
+          link_data: linkData
         };
-        
+
         console.log('🖼️ Creating Link image ad creative');
       }
       

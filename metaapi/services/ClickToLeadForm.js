@@ -153,23 +153,33 @@ class ClickToLeadFormService {
         }
         
         const questionObj = { type: questionType };
-        
-        // For CUSTOM type, add label and field_type
+
+        // For CUSTOM type Meta only accepts `label` and (for choice questions) `options`.
+        // It rejects any "field_type" key — so we use field_type only to decide the shape here.
         if (questionType === 'CUSTOM') {
           if (q.label) {
             questionObj.label = q.label;
           }
-          if (q.field_type) {
-            questionObj.field_type = q.field_type;
+
+          // Build options for choice-style custom questions.
+          let opts = null;
+          if (q.field_type === 'MULTIPLE_CHOICE' && Array.isArray(q.options)) {
+            opts = q.options.filter(opt => opt && String(opt).trim() !== '');
+          } else if (q.field_type === 'YESNO') {
+            opts = ['Yes', 'No'];
           }
-          
-          // Add options for MULTIPLE_CHOICE
-          if (q.field_type === 'MULTIPLE_CHOICE' && q.options && q.options.length > 0) {
-            questionObj.options = q.options.filter(opt => opt && opt.trim() !== '');
+
+          // Meta expects options as objects: { value, key }
+          if (opts && opts.length > 0) {
+            questionObj.options = opts.map(opt => {
+              const value = String(opt).trim();
+              const key = value.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'option';
+              return { value, key };
+            });
           }
         }
-        // Standard types don't need label
-        
+        // Standard types and free-text custom questions don't need anything else.
+
         return questionObj;
       });
       
@@ -486,16 +496,23 @@ class ClickToLeadFormService {
         
         console.log('📹 Creating Lead Form video ad creative');
       } else {
-        // For image ads, use link_data
+        // For image ads, use link_data. Prefer a Meta image_hash (uploaded to the
+        // ad account) and fall back to a public picture URL.
+        const linkData = {
+          link: creativeData.business_page_url,
+          message: creativeData.primary_text || '',
+          name: creativeData.headline || '',
+          description: creativeData.description || '',
+          call_to_action: callToAction
+        };
+        if (creativeData.image_hash) {
+          linkData.image_hash = creativeData.image_hash;
+        } else if (creativeData.picture_url) {
+          linkData.picture = creativeData.picture_url;
+        }
         objectStorySpec = {
           page_id: creativeData.page_id,
-          link_data: {
-            picture: creativeData.picture_url,
-            link: creativeData.business_page_url,
-            name: creativeData.headline || '',
-            description: creativeData.description || '',
-            call_to_action: callToAction
-          }
+          link_data: linkData
         };
         
         console.log('🖼️ Creating Lead Form image ad creative');

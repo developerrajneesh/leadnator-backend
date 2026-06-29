@@ -132,14 +132,82 @@ router.post("/connect", async (req, res, next) => {
       connectedAt: new Date(),
     });
 
+    // Auto-subscribe ALL of the user's Pages to `leadgen` webhooks the moment they
+    // connect — so leads from every page (including existing/old forms) start
+    // flowing into the CRM automatically. Silent + best-effort: never block connect.
+    const webhookSummary = await autoSubscribeAllPages(req, longLivedToken).catch((e) => {
+      console.error("Auto page webhook subscription failed:", e.message);
+      return { subscribed: 0, total: 0 };
+    });
+
     res.json({
       connected: true,
       fbUser: { id: me.id, name: me.name, email: me.email },
       accounts: adList,
       selectedAdAccountId: defaultAccount,
+      webhooks: webhookSummary,
     });
   } catch (err) { next(err); }
 });
+
+// Fetch every Page the user manages, persist their page tokens, and subscribe
+// each Page to `leadgen` webhook events. Used on connect so lead delivery is set
+// up for the whole account with no extra UI/steps for the user.
+async function autoSubscribeAllPages(req, userToken) {
+  const summary = { subscribed: 0, total: 0, failed: 0 };
+
+  const pagesResp = await fbRequest({
+    method: "get",
+    url: `${FB_GRAPH_BASE}/me/accounts`,
+    params: { fields: "id,name,access_token", limit: 100 },
+    accessToken: userToken,
+  });
+  const pageList = (pagesResp?.data || []).filter((p) => p?.id && p?.access_token);
+  summary.total = pageList.length;
+  if (pageList.length === 0) return summary;
+
+  const user = await User.findById(req.user._id).select("+meta.pages.accessToken +meta.webhookVerifyToken");
+  if (!user) return summary;
+  user.meta = user.meta || {};
+  // Ensure a webhook verify token exists for this user.
+  if (!user.meta.webhookVerifyToken) {
+    user.meta.webhookVerifyToken = require("crypto").randomBytes(18).toString("base64url");
+  }
+
+  // Subscribe each Page to leadgen events with its own Page access token.
+  const results = await Promise.allSettled(
+    pageList.map((p) =>
+      fbRequest({
+        method: "post",
+        url: `${FB_GRAPH_BASE}/${p.id}/subscribed_apps`,
+        data: { subscribed_fields: "leadgen" },
+        accessToken: p.access_token,
+      })
+    )
+  );
+
+  // Persist pages (preserve prior subscribed flags on failure).
+  const prevById = Object.fromEntries((user.meta.pages || []).map((p) => [p.id, p]));
+  user.meta.pages = pageList.map((p, i) => {
+    const ok = results[i].status === "fulfilled";
+    if (ok) summary.subscribed += 1;
+    else {
+      summary.failed += 1;
+      console.error(`Auto-subscribe failed for page ${p.id} (${p.name}):`, results[i].reason?.message);
+    }
+    return {
+      id: p.id,
+      name: p.name,
+      accessToken: p.access_token,
+      subscribed: ok || prevById[p.id]?.subscribed || false,
+      subscribedAt: ok ? new Date() : (prevById[p.id]?.subscribedAt || null),
+    };
+  });
+
+  await user.save();
+  console.log(`✅ Auto-subscribed ${summary.subscribed}/${summary.total} page(s) to leadgen webhooks`);
+  return summary;
+}
 
 router.post("/select-account", async (req, res, next) => {
   try {
