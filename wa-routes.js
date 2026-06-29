@@ -394,6 +394,11 @@ router.post("/connect", requireWhatsApp, async (req, res, next) => {
       return res.status(400).json({ error: "phoneNumberId and accessToken are required" });
     }
 
+    // Always have a verify token so we can claim this WABA's webhooks via override
+    // (works even if the number was set up on another platform/BSP).
+    const verifyTokenToUse = (webhookVerifyToken && webhookVerifyToken.trim())
+      || require("crypto").randomBytes(18).toString("base64url");
+
     // Verify by fetching phone number details
     let phoneInfo = null;
     try {
@@ -422,7 +427,7 @@ router.post("/connect", requireWhatsApp, async (req, res, next) => {
         phoneNumberId,
         accessToken,
         businessAccountId,
-        webhookVerifyToken,
+        webhookVerifyToken: verifyTokenToUse,
         phoneNumber: phoneInfo?.display_phone_number || "",
         verifiedName: phoneInfo?.verified_name || "",
         quality: phoneInfo?.quality_rating || "",
@@ -437,9 +442,20 @@ router.post("/connect", requireWhatsApp, async (req, res, next) => {
       { force: isNewPhone, pin }
     );
 
+    // Always (re)subscribe the WABA to our app on connect so every newly connected
+    // WhatsApp account is wired to the platform and its messages reach our webhook.
+    // The subscribe call is idempotent, so forcing it every time is safe.
+    //
+    // When a public webhook base is configured, also pass a per-WABA webhook
+    // OVERRIDE so this account routes its events to OUR endpoint — even if it was
+    // created / previously connected on another platform (BSP).
+    const publicBase = String(process.env.PUBLIC_WEBHOOK_BASE || "").trim();
+    const overrideCallbackUri = publicBase
+      ? `${publicBase.replace(/\/$/, "")}/webhooks/whatsapp`
+      : null;
     const wabaSubscription = await ensureWabaSubscribed(
       { businessAccountId: businessAccountId || conn.businessAccountId, accessToken: conn.accessToken },
-      { force: isNewWaba || (isNewPhone && !!businessAccountId) }
+      { force: true, overrideCallbackUri, verifyToken: verifyTokenToUse }
     );
 
     // Best-effort: pull the rest of the WABA + phone info right away so the

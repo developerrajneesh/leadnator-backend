@@ -38,19 +38,28 @@ function isAppSubscribed(list, targetAppId) {
   });
 }
 
-async function subscribeWabaToApp(wabaId, accessToken) {
+async function subscribeWabaToApp(wabaId, accessToken, { overrideCallbackUri, verifyToken } = {}) {
+  const data = {};
+  // Claim THIS WABA's webhooks for our endpoint even if the account was created /
+  // previously connected on another platform (BSP). Meta routes this WABA's events
+  // to our override URL regardless of the app-level webhook config.
+  if (overrideCallbackUri && verifyToken) {
+    data.override_callback_uri = overrideCallbackUri;
+    data.verify_token = verifyToken;
+  }
   return fb({
     method: "post",
     url: `${FB_GRAPH_BASE}/${wabaId}/subscribed_apps`,
-    data: {},
+    data,
     token: accessToken,
   });
 }
 
 /**
  * Subscribe this Meta app to a WABA. Best-effort; safe to call repeatedly.
+ * Pass overrideCallbackUri + verifyToken to take over the WABA's webhook routing.
  */
-async function ensureWabaSubscribed(conn, { force = false } = {}) {
+async function ensureWabaSubscribed(conn, { force = false, overrideCallbackUri, verifyToken } = {}) {
   const wabaId = String(conn?.businessAccountId || "").trim();
   const accessToken = conn?.accessToken;
   if (!wabaId || !accessToken) {
@@ -70,13 +79,13 @@ async function ensureWabaSubscribed(conn, { force = false } = {}) {
         return { attempted: false, subscribed: true, alreadySubscribed: true, wabaId };
       }
     } catch {
-      if (!force) return { attempted: false, subscribed: false, reason: "subscription check failed", wabaId };
+      /* Subscription check failed — fall through and try to subscribe anyway. */
     }
   }
 
   try {
-    const result = await subscribeWabaToApp(wabaId, accessToken);
-    return { attempted: true, subscribed: true, wabaId, result };
+    const result = await subscribeWabaToApp(wabaId, accessToken, { overrideCallbackUri, verifyToken });
+    return { attempted: true, subscribed: true, overrode: !!(overrideCallbackUri && verifyToken), wabaId, result };
   } catch (err) {
     if (isAlreadySubscribedError(err)) {
       return { attempted: true, subscribed: true, alreadySubscribed: true, wabaId };
