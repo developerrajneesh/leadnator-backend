@@ -42,8 +42,14 @@ router.get("/", async (req, res) => {
 
   if (mode !== "subscribe" || !token) return res.sendStatus(400);
 
-  // Match against any user's saved verify token.
+  // Accept the app-level global verify token (admin configures one webhook in the
+  // Meta App Dashboard for the whole platform) OR any individual user's saved token.
   try {
+    const globalToken = String(process.env.WEBHOOK_VERIFY_TOKEN || "").trim();
+    if (globalToken && token === globalToken) {
+      log("→ 200: verified with WEBHOOK_VERIFY_TOKEN from .env");
+      return res.status(200).send(challenge);
+    }
     const user = await User.findOne({ "meta.webhookVerifyToken": token }).select("+meta.webhookVerifyToken");
     if (user) {
       log(`→ 200: verified for user ${user._id}`);

@@ -1070,21 +1070,34 @@ router.get("/comments", requireIg, async (req, res, next) => {
 
     // Pull live comments from the user's recent posts via the Graph API and
     // upsert them, preserving any reply state we've already recorded locally.
+    // `warning` surfaces *why* nothing showed up (no posts, no comments, or a
+    // missing permission) so the UI can tell the user instead of a blank table.
+    let warning = null;
+    let syncedCount = 0;
     try {
       const token = await userMetaToken(req);
       const accessToken = req.ig.pageAccessToken || token;
       const mediaRes = await fetchIgMedia(req.ig, token, { limit: 25 });
-      const media = (mediaRes?.data || [])
-        .filter((m) => (m.comments_count ?? 0) > 0)
-        .slice(0, 8);
+      const allMedia = mediaRes?.data || [];
+      // Posts with a known comment count > 0 first; if counts are unknown (null),
+      // still probe a few recent posts so we don't miss comments.
+      const withComments = allMedia.filter((m) => (m.comments_count ?? 0) > 0);
+      const unknownCount = allMedia.filter((m) => m.comments_count == null);
+      const media = (withComments.length ? withComments : unknownCount).slice(0, 8);
+
+      if (allMedia.length === 0) {
+        warning = "No Instagram posts found on the connected account yet.";
+      } else if (media.length === 0) {
+        warning = "None of your recent posts have comments yet.";
+      }
 
       // Fetch comments for all posts in parallel, then bulk-upsert — keeps the
       // request fast even when several posts have comments.
       const perMedia = await Promise.all(
         media.map((m) =>
           fetchMediaComments(req.ig, req, m.id, accessToken)
-            .then((r) => ({ mediaId: m.id, items: r.items || [] }))
-            .catch(() => ({ mediaId: m.id, items: [] }))
+            .then((r) => ({ mediaId: m.id, items: r.items || [], error: r.error || null }))
+            .catch((e) => ({ mediaId: m.id, items: [], error: e.message }))
         )
       );
 
@@ -1092,6 +1105,7 @@ router.get("/comments", requireIg, async (req, res, next) => {
       for (const { mediaId, items } of perMedia) {
         for (const c of items) {
           if (!c.id) continue;
+          syncedCount += 1;
           ops.push({
             updateOne: {
               filter: { user: req.user._id, commentId: c.id },
@@ -1105,13 +1119,22 @@ router.get("/comments", requireIg, async (req, res, next) => {
         }
       }
       if (ops.length) await InstagramComment.bulkWrite(ops, { ordered: false });
+
+      // If we found posts-with-comments but couldn't read any, surface the API
+      // reason (usually a missing comments permission) so the user can fix it.
+      if (syncedCount === 0 && media.length > 0 && !warning) {
+        warning = perMedia.find((p) => p.error)?.error
+          || "Couldn't read comments — reconnect Instagram with the comments permission in Settings.";
+      }
     } catch (e) {
       console.warn("[instagram] comments sync:", e.message);
+      warning = e.message || "Failed to fetch comments from Instagram.";
     }
 
     const comments = await InstagramComment.find({ user: req.user._id }).sort({ createdAt: -1 }).limit(100);
 
     res.json({
+      warning: comments.length ? null : warning,
       comments: comments.map((c) => ({
         id: c._id.toString(),
         commentId: c.commentId,

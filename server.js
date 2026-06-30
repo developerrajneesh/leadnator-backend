@@ -1456,6 +1456,16 @@ app.get("/api/admin/users/:id", authRequired, adminOnly, ah(async (req, res) => 
   const leadByOrg   = orgLeadCounts.reduce((a, c) => ((a[c._id.toString()] = c.count), a), {});
   const memberByOrg = orgMemberCounts.reduce((a, c) => ((a[c._id.toString()] = c.count), a), {});
 
+  // Meta (Facebook) Ads connection is stored on the Organization, so look across
+  // this user's workspaces and surface the first connected one.
+  const Organization = require("./models/Organization");
+  const orgMetas = orgIds.length
+    ? await Organization.find({ _id: { $in: orgIds } }).select("meta")
+    : [];
+  const metaConn =
+    orgMetas.find((o) => o?.meta && (o.meta.fbUserId || o.meta.adAccountId))?.meta ||
+    (target.meta && (target.meta.fbUserId || target.meta.adAccountId) ? target.meta : null);
+
   res.json({
     user: target.toJSON(),
     stats: {
@@ -1489,6 +1499,7 @@ app.get("/api/admin/users/:id", authRequired, adminOnly, ah(async (req, res) => 
       email:     { connected: !!(emailCfg && emailCfg.verified), from: emailCfg?.fromEmail || "" },
       storage:   { connected: !!(storageCfg && storageCfg.provider), provider: storageCfg?.provider || "" },
       google:    { connected: !!googleAcc, email: googleAcc?.email || "" },
+      meta:      { connected: !!metaConn, name: metaConn?.fbUserName || "", adAccountId: metaConn?.adAccountId || "" },
     },
   });
 }));
@@ -1613,10 +1624,12 @@ app.get("/api/admin/revenue", authRequired, adminOnly, ah(async (_req, res) => {
 // ---------- ADMIN ACTIVITY LOGS (audit trail) ----------
 app.get("/api/admin/logs", authRequired, adminOnly, ah(async (req, res) => {
   const ActivityLog = require("./models/ActivityLog");
-  const { q = "", module = "all", method = "all", page = "1", limit = "50" } = req.query;
+  const { q = "", module = "all", method = "all", page = "1", limit = "50", user = "" } = req.query;
   const filter = {};
   if (module !== "all") filter.module = module;
   if (method !== "all") filter.method = method;
+  if (user && /^[0-9a-f]{24}$/i.test(user)) filter.user = user; // scope to a single user
+
   if (q.trim()) {
     const rx = new RegExp(q.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
     filter.$or = [{ userEmail: rx }, { userName: rx }, { action: rx }, { path: rx }, { ip: rx }];
@@ -1644,6 +1657,37 @@ app.put("/api/admin/master-password", authRequired, adminOnly, ah(async (req, re
 app.delete("/api/admin/master-password", authRequired, adminOnly, ah(async (_req, res) => {
   await adminConfig.clearMasterPassword();
   res.json({ ok: true, ...(await adminConfig.statusPayload()) });
+}));
+
+// ---------- ADMIN WEBHOOKS (app-level Meta webhook config) ----------
+// The webhook callback URLs + verify token are an APP-level concern: the admin
+// pastes them once into the Meta App Dashboard. Users never see these.
+app.get("/api/admin/webhooks", authRequired, adminOnly, ah(async (_req, res) => {
+  const verifyToken = String(process.env.WEBHOOK_VERIFY_TOKEN || "").trim();
+  // Return only the route PATHS — the frontend prepends the backend origin it
+  // already targets (derived from VITE_API_URL) so the displayed URL always
+  // matches the API the app talks to.
+  res.json({
+    verifyToken,
+    hasVerifyToken: !!verifyToken,
+    endpoints: [
+      { key: "meta", name: "Meta — Facebook Pages & Lead Ads", object: "Page", subscribe: ["leadgen"], path: "/webhooks/facebook" },
+      { key: "whatsapp", name: "WhatsApp Business", object: "whatsapp_business_account", subscribe: ["messages", "message_template_status_update", "account_update"], path: "/webhooks/whatsapp" },
+      { key: "instagram", name: "Instagram", object: "Instagram", subscribe: ["messages", "comments", "mentions"], path: "/webhooks/instagram" },
+    ],
+    // Razorpay authenticates webhooks with a shared SECRET (HMAC signature), not a
+    // verify token — so it's surfaced separately from the Meta endpoints.
+    razorpay: {
+      name: "Razorpay",
+      path: "/webhooks/razorpay",
+      secretConfigured: !!String(process.env.RAZORPAY_WEBHOOK_SECRET || "").trim(),
+      events: [
+        "payment.captured", "payment.failed",
+        "subscription.activated", "subscription.charged",
+        "subscription.cancelled", "subscription.completed",
+      ],
+    },
+  });
 }));
 
 app.get("/api/admin/stats", authRequired, adminOnly, ah(async (_req, res) => {
