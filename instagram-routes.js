@@ -146,7 +146,8 @@ router.post("/connect", async (req, res, next) => {
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
-    res.json({ connected: true, connection: conn.toJSON() });
+    const webhookSub = await subscribeInstagramApp(conn);
+    res.json({ connected: true, connection: conn.toJSON(), webhookSub });
   } catch (err) { next(err); }
 });
 
@@ -156,6 +157,47 @@ router.post("/disconnect", async (req, res, next) => {
     res.json({ disconnected: true });
   } catch (err) { next(err); }
 });
+
+// Subscribe the already-connected account to webhooks without re-doing OAuth.
+router.post("/webhook/subscribe", requireIg, async (req, res, next) => {
+  try {
+    const r = await subscribeInstagramApp(req.ig);
+    res.json(r);
+  } catch (err) { next(err); }
+});
+
+// Subscribe a connected Instagram account to THIS app's webhooks so comment &
+// message events are delivered to /webhooks/instagram. Best-effort + idempotent.
+async function subscribeInstagramApp(conn) {
+  const fields = "comments,messages";
+  const onIgHost = conn.authMethod === "oauth" || !conn.pageId;
+  try {
+    if (onIgHost) {
+      // Instagram Login → graph.instagram.com/{ig-id}/subscribed_apps
+      await fb({
+        method: "post",
+        url: `${IG_GRAPH_BASE}/${conn.igAccountId}/subscribed_apps`,
+        params: { subscribed_fields: fields },
+        token: conn.pageAccessToken,
+      });
+    } else if (conn.pageId && conn.pageAccessToken) {
+      // Facebook-Page linked → subscribe the Page on graph.facebook.com
+      await fb({
+        method: "post",
+        url: `${FB_GRAPH_BASE}/${conn.pageId}/subscribed_apps`,
+        params: { subscribed_fields: fields },
+        token: conn.pageAccessToken,
+      });
+    } else {
+      return { subscribed: false, error: "no usable token/account" };
+    }
+    console.log(`[instagram] webhook subscribed (${onIgHost ? "ig" : "fb"}) for ${conn.username || conn.igAccountId}`);
+    return { subscribed: true };
+  } catch (e) {
+    console.warn("[instagram] webhook subscribe failed:", e.message);
+    return { subscribed: false, error: e.message };
+  }
+}
 
 // Instagram Business Login — exchange OAuth `code` → short-lived → long-lived (60d) → MongoDB
 router.post("/oauth/callback", async (req, res, next) => {
@@ -268,11 +310,15 @@ router.post("/oauth/callback", async (req, res, next) => {
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
+    // Subscribe this account to our app's webhooks so comment/message events flow in.
+    const webhookSub = await subscribeInstagramApp(conn);
+
     res.json({
       connected: true,
       connection: conn.toJSON(),
       tokenExpiresAt,
       isLongLived,
+      webhookSub,
     });
   } catch (err) {
     console.error("[instagram/oauth]", err.message);
@@ -412,26 +458,63 @@ function mapMetaMessage(m, igAccountId, conversationId, peer = {}, selfUsername 
 }
 
 async function fetchMetaConversations(ig, req) {
-  const tokens = await inboxAccessTokens(ig, req);
   const igId = ig.igAccountId;
-  if (!igId) return { list: [], error: null };
+  const onIgHost = useIgGraphHost(ig);
+  const F = IG_CONVO_FIELDS;
+  const debug = {
+    onIgHost, authMethod: ig.authMethod || null,
+    igAccountId: igId || null, pageId: ig.pageId || null,
+    hasPageAccessToken: !!ig.pageAccessToken, tries: [],
+  };
 
-  const url = `${inboxBase(ig)}/${inboxAccountPath(ig)}/conversations`;
-  let lastError = null;
-  for (const token of tokens) {
-    try {
-      const data = await fb({
-        method: "get",
-        url,
-        params: { platform: "instagram", fields: IG_CONVO_FIELDS, limit: "50" },
-        token,
-      });
-      return { list: (data?.data || []).map((c) => mapMetaConversation(c, igId, ig.username)), error: null };
-    } catch (e) {
-      lastError = e.message;
+  // Build candidate attempts across BOTH hosts so we find threads regardless of
+  // how the account was connected (Instagram Login vs Facebook Page).
+  const attempts = [];
+
+  // 1) Instagram-Login host (graph.instagram.com/me/conversations).
+  if (onIgHost && ig.pageAccessToken) {
+    attempts.push({ label: "ig:me", url: `${IG_GRAPH_BASE}/me/conversations`, token: ig.pageAccessToken, params: { fields: F, limit: "50" } });
+    attempts.push({ label: "ig:me+platform", url: `${IG_GRAPH_BASE}/me/conversations`, token: ig.pageAccessToken, params: { platform: "instagram", fields: F, limit: "50" } });
+    if (igId) {
+      attempts.push({ label: "ig:igid", url: `${IG_GRAPH_BASE}/${igId}/conversations`, token: ig.pageAccessToken, params: { fields: F, limit: "50" } });
     }
   }
-  return { list: [], error: lastError };
+
+  // 2) Facebook-Page host (graph.facebook.com) using the linked Page token.
+  const pageToken = await resolveFacebookPageTokenForIg(ig, req);
+  if (pageToken && igId) {
+    attempts.push({ label: "fb:igid", url: `${FB_GRAPH_BASE}/${igId}/conversations`, token: pageToken, params: { platform: "instagram", fields: F, limit: "50" } });
+  }
+  if (pageToken && ig.pageId) {
+    attempts.push({ label: "fb:pageid", url: `${FB_GRAPH_BASE}/${ig.pageId}/conversations`, token: pageToken, params: { platform: "instagram", fields: F, limit: "50" } });
+  }
+  // 3) Page-auth access token (non-IG-host connections).
+  if (!onIgHost && ig.pageAccessToken && igId && ig.pageAccessToken !== pageToken) {
+    attempts.push({ label: "fb:igid+pat", url: `${FB_GRAPH_BASE}/${igId}/conversations`, token: ig.pageAccessToken, params: { platform: "instagram", fields: F, limit: "50" } });
+  }
+
+  if (attempts.length === 0) {
+    debug.tries.push({ label: "none", error: "no usable token/account" });
+    return { list: [], error: "No Instagram messaging access — reconnect Instagram with the messages permission (instagram_business_manage_messages).", debug };
+  }
+
+  let lastError = null;
+  for (const a of attempts) {
+    try {
+      const data = await fb({ method: "get", url: a.url, params: a.params, token: a.token });
+      const raw = data?.data || [];
+      debug.tries.push({ label: a.label, count: raw.length });
+      console.log(`[instagram] conversations ${a.label} → ${raw.length} thread(s)`);
+      if (raw.length > 0) {
+        return { list: raw.map((c) => mapMetaConversation(c, igId, ig.username)), error: null, debug };
+      }
+    } catch (e) {
+      lastError = e.message;
+      debug.tries.push({ label: a.label, error: e.message });
+      console.warn(`[instagram] conversations ${a.label} failed:`, e.message);
+    }
+  }
+  return { list: [], error: lastError, debug };
 }
 
 async function syncMetaMessagesToDb(ig, req, conversationId, peer = {}) {
@@ -536,14 +619,24 @@ function mergeConversations(local, remote) {
 
 router.get("/conversations", requireIg, async (req, res, next) => {
   try {
-    const { list: remote, error: syncError } = await fetchMetaConversations(req.ig, req);
+    const { list: remote, error: syncError, debug } = await fetchMetaConversations(req.ig, req);
     const local = await listConversationsFromDb(req.user._id);
     const conversations = mergeConversations(local, remote);
+
+    // Temporary DB diagnostics — are there ANY stored IG messages, and how many
+    // belong to THIS user/workspace vs others?
+    let dbTotal = null, dbForUser = null;
+    try {
+      dbTotal = await InstagramMessage.countDocuments();
+      dbForUser = await InstagramMessage.countDocuments({ user: req.user._id });
+    } catch { /* ignore */ }
 
     res.json({
       conversations,
       username: req.ig.username,
       syncError: syncError && conversations.length === 0 ? syncError : null,
+      // Temporary diagnostics — shows which Graph attempts ran and their counts.
+      debug: { ...debug, localFromDb: local.length, liveFromMeta: remote.length, dbTotal, dbForUser, currentUser: String(req.user._id) },
     });
   } catch (err) { next(err); }
 });
@@ -874,6 +967,7 @@ async function fetchMediaComments(ig, req, mediaId, accessToken, embedded = null
 
   // Instagram Login token → graph.instagram.com only (IG media IDs are not valid on graph.facebook.com).
   if (ig.pageAccessToken) {
+    // (a) the comments edge
     for (const fields of COMMENT_FIELD_SETS) {
       attempts.push({
         url: `${IG_GRAPH_BASE}/${mediaId}/comments`,
@@ -882,6 +976,14 @@ async function fetchMediaComments(ig, req, mediaId, accessToken, embedded = null
         label: "instagram",
       });
     }
+    // (b) embedded on the media object — behaves differently on some setups
+    attempts.push({
+      url: `${IG_GRAPH_BASE}/${mediaId}`,
+      token: ig.pageAccessToken,
+      fields: "comments{id,text,timestamp,username,like_count}",
+      label: "instagram_embedded",
+      embedded: true,
+    });
   }
 
   // Facebook Page linked to same IG account → graph.facebook.com (full comment text).
@@ -910,20 +1012,17 @@ async function fetchMediaComments(ig, req, mediaId, accessToken, embedded = null
   }
 
   const errors = [];
-  for (const { url, token, fields } of attempts) {
+  for (const { url, token, fields, label, embedded } of attempts) {
     try {
-      const commentsRes = await fb({
-        method: "get",
-        url,
-        params: { fields, limit: "50" },
-        token,
-      });
-      const items = (commentsRes?.data || []).map(mapIgComment);
+      const params = embedded ? { fields } : { fields, limit: "50" };
+      const resData = await fb({ method: "get", url, params, token });
+      const rows = embedded ? (resData?.comments?.data || []) : (resData?.data || []);
+      const items = rows.map(mapIgComment);
       if (items.length > 0) {
-        return { items, paging: commentsRes?.paging || null, error: null, source: "edge" };
+        return { items, paging: (embedded ? resData?.comments?.paging : resData?.paging) || null, error: null, source: label };
       }
     } catch (e) {
-      errors.push(e.message);
+      errors.push(`${label}: ${e.message}`);
     }
   }
 
@@ -935,6 +1034,7 @@ async function fetchMediaComments(ig, req, mediaId, accessToken, embedded = null
     items: [],
     paging: null,
     error: permissionHint || (errors.length ? errors[errors.length - 1] : null),
+    rawErrors: errors,
     source: null,
   };
 }
@@ -1074,11 +1174,16 @@ router.get("/comments", requireIg, async (req, res, next) => {
     // missing permission) so the UI can tell the user instead of a blank table.
     let warning = null;
     let syncedCount = 0;
+    const dbg = { tries: [] };
     try {
       const token = await userMetaToken(req);
       const accessToken = req.ig.pageAccessToken || token;
       const mediaRes = await fetchIgMedia(req.ig, token, { limit: 25 });
       const allMedia = mediaRes?.data || [];
+      dbg.allMedia = allMedia.length;
+      dbg.commentCounts = allMedia.slice(0, 8).map((m) => m.comments_count ?? null);
+      dbg.hasPageAccessToken = !!req.ig.pageAccessToken;
+      dbg.authMethod = req.ig.authMethod || null;
       // Posts with a known comment count > 0 first; if counts are unknown (null),
       // still probe a few recent posts so we don't miss comments.
       const withComments = allMedia.filter((m) => (m.comments_count ?? 0) > 0);
@@ -1096,10 +1201,12 @@ router.get("/comments", requireIg, async (req, res, next) => {
       const perMedia = await Promise.all(
         media.map((m) =>
           fetchMediaComments(req.ig, req, m.id, accessToken)
-            .then((r) => ({ mediaId: m.id, items: r.items || [], error: r.error || null }))
-            .catch((e) => ({ mediaId: m.id, items: [], error: e.message }))
+            .then((r) => ({ mediaId: m.id, items: r.items || [], error: r.error || null, rawErrors: r.rawErrors || [] }))
+            .catch((e) => ({ mediaId: m.id, items: [], error: e.message, rawErrors: [e.message] }))
         )
       );
+      dbg.mediaProbed = media.length;
+      dbg.rawErrors = [...new Set(perMedia.flatMap((p) => p.rawErrors))].slice(0, 5);
 
       const ops = [];
       for (const { mediaId, items } of perMedia) {
@@ -1135,6 +1242,7 @@ router.get("/comments", requireIg, async (req, res, next) => {
 
     res.json({
       warning: comments.length ? null : warning,
+      debug: { ...dbg, synced: syncedCount, returned: comments.length },
       comments: comments.map((c) => ({
         id: c._id.toString(),
         commentId: c.commentId,

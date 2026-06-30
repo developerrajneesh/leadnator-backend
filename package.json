@@ -7,7 +7,8 @@
     "start": "node --use-system-ca server.js",
     "dev": "nodemon --exec \"node --use-system-ca\" server.js",
     "seed": "node --use-system-ca seed.js",
-    "wa:subscribe-all": "node --use-system-ca scripts/subscribe-all-wabas.js"
+    "wa:subscribe-all": "node --use-system-ca scripts/subscribe-all-wabas.js",
+    "ig:subscribe-all": "node --use-system-ca scripts/subscribe-all-instagram.js"
   },
   "dependencies": {
     "@aws-sdk/client-ses": "^3.1054.0",

@@ -11,6 +11,7 @@ const router = express.Router();
 const InstagramConnection = require("../models/InstagramConnection");
 const InstagramFlow = require("../models/InstagramFlow");
 const InstagramComment = require("../models/InstagramComment");
+const InstagramMessage = require("../models/InstagramMessage");
 
 const FB_API_VERSION = process.env.META_API_VERSION || "v23.0";
 const FB_GRAPH_BASE = `https://graph.facebook.com/${FB_API_VERSION}`;
@@ -204,6 +205,19 @@ async function handleCommentEvent(igAccountId, value) {
     ranAny = true;
   }
 
+  // Settings-level default auto-reply (Instagram → Settings → "Auto-reply to new
+  // comments") — runs when no Automation-builder flow already handled it.
+  if (!ranAny && conn.settings?.commentAutoReply && String(conn.settings?.commentReplyText || "").trim()) {
+    const msg = fillVars(conn.settings.commentReplyText, vars);
+    try {
+      await fb({ method: "post", url: `${graphBaseFor(conn)}/${commentId}/replies`, data: { message: msg }, token });
+      console.log(`[webhook/instagram] settings auto-reply to comment ${commentId}`);
+      ranAny = true;
+    } catch (e) {
+      console.warn("[webhook/instagram] settings comment reply failed:", e.message);
+    }
+  }
+
   // Record the comment so it shows in the Comments page and isn't re-processed.
   await InstagramComment.updateOne(
     { user: conn.user, commentId },
@@ -214,26 +228,76 @@ async function handleCommentEvent(igAccountId, value) {
     { upsert: true }
   );
 
-  if (!ranAny) console.log("[webhook/instagram] no flow matched comment", commentId);
+  if (!ranAny) console.log("[webhook/instagram] no flow/setting matched comment", commentId);
 }
 
 // ---------- DM automation ----------
 async function handleMessageEvent(igAccountId, messaging) {
+  const conn = await InstagramConnection.findOne({
+    $or: [{ igAccountId }, { pageId: igAccountId }],
+  }).select("+pageAccessToken");
+  if (!conn) return;
+
+  // ---- Persist the DM so it shows in the inbox (both incoming and our echoes) ----
+  const m = messaging?.message;
+  if (m && m.mid) {
+    const echo = !!m.is_echo;
+    const peerId = echo ? messaging?.recipient?.id : messaging?.sender?.id;
+    if (peerId && String(peerId) !== String(igAccountId)) {
+      const attachments = (m.attachments || []).map((a) => ({
+        type: a.type || "file",
+        url: a.payload?.url || "",
+        previewUrl: a.payload?.url || "",
+      }));
+      try {
+        await InstagramMessage.findOneAndUpdate(
+          { user: conn.user, metaMessageId: m.mid },
+          {
+            $set: {
+              user: conn.user,
+              conversationId: String(peerId),
+              igUserId: String(peerId),
+              direction: echo ? "out" : "in",
+              text: m.text || "",
+              attachments,
+              read: echo,
+            },
+          },
+          { upsert: true, setDefaultsOnInsert: true }
+        );
+      } catch (e) {
+        console.warn("[webhook/instagram] persist message failed:", e.message);
+      }
+    }
+  }
+
+  // ---- Auto-reply / flows run only for genuine inbound messages ----
   const senderId = messaging?.sender?.id;
   const text = messaging?.message?.text || "";
   const isEcho = messaging?.message?.is_echo;
   if (!senderId || isEcho || senderId === igAccountId) return;
 
-  const conn = await InstagramConnection.findOne({
-    $or: [{ igAccountId }, { pageId: igAccountId }],
-  }).select("+pageAccessToken");
-  if (!conn) return;
+  // Settings-level default auto-reply (Instagram → Settings → "Auto-reply to new DMs").
+  if (conn.settings?.dmAutoReply && String(conn.settings?.dmAutoReplyText || "").trim()) {
+    try {
+      await fb({
+        method: "post",
+        url: `${graphBaseFor(conn)}/${accountPathFor(conn)}/messages`,
+        data: { recipient: { id: senderId }, message: { text: conn.settings.dmAutoReplyText } },
+        token: conn.pageAccessToken,
+      });
+      console.log(`[webhook/instagram] settings auto-reply DM to ${senderId}`);
+    } catch (e) {
+      console.warn("[webhook/instagram] settings dm reply failed:", e.message);
+    }
+  }
 
   const flows = await InstagramFlow.find({
     user: conn.user,
     trigger: { $in: ["dm.received", "keyword.dm"] },
     status: "active",
   });
+  console.log(`[webhook/instagram] inbound DM from ${senderId} → conn.user=${conn.user} text="${text}" → ${flows.length} active DM flow(s)`);
   if (!flows.length) return;
 
   const token = conn.pageAccessToken;
