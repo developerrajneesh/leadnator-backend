@@ -295,6 +295,7 @@ router.post("/oauth/callback", async (req, res, next) => {
         user: req.user._id,
         organization: tenantId(req),
         igAccountId: String(profile.status === 200 ? (profile.data?.id || igUserId) : igUserId),
+        igUserId: String(igUserId), // webhook entry.id matches this for Instagram-Login
         username,
         name,
         profilePictureUrl,

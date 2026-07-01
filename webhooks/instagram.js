@@ -110,6 +110,7 @@ function simulateCommentFlow(flow, { text = "", mediaId = "", username = "tester
 async function handleCommentEvent(igAccountId, value) {
   const commentId = value?.id;
   const text = value?.text || "";
+  console.log(`[webhook/instagram] 💬 comment event account=${igAccountId} comment=${commentId} from=@${value?.from?.username || "?"} text="${text}"`);
   const mediaId = value?.media?.id || value?.media_id || "";
   const fromId = value?.from?.id || "";
   const fromUsername = value?.from?.username || "";
@@ -123,7 +124,7 @@ async function handleCommentEvent(igAccountId, value) {
   }
 
   const conn = await InstagramConnection.findOne({
-    $or: [{ igAccountId }, { pageId: igAccountId }],
+    $or: [{ igAccountId }, { pageId: igAccountId }, { igUserId: igAccountId }],
   }).select("+pageAccessToken");
   if (!conn) {
     console.warn("[webhook/instagram] no connection for ig account", igAccountId);
@@ -233,17 +234,62 @@ async function handleCommentEvent(igAccountId, value) {
 
 // ---------- DM automation ----------
 async function handleMessageEvent(igAccountId, messaging) {
+  const evType = messaging?.message
+    ? (messaging.message.is_echo ? "echo" : "message")
+    : messaging?.message_edit ? "message_edit"
+    : messaging?.reaction ? "reaction"
+    : messaging?.postback ? "postback"
+    : messaging?.read ? "read"
+    : messaging?.message_reactions ? "message_reactions"
+    : "other";
+  console.log(`[webhook/instagram] 📩 messaging event=${evType} account=${igAccountId} from=${messaging?.sender?.id || "?"} to=${messaging?.recipient?.id || "?"}`);
+
   const conn = await InstagramConnection.findOne({
-    $or: [{ igAccountId }, { pageId: igAccountId }],
+    $or: [{ igAccountId }, { pageId: igAccountId }, { igUserId: igAccountId }],
   }).select("+pageAccessToken");
-  if (!conn) return;
+  if (!conn) {
+    console.warn(`[webhook/instagram] ⚠ no connection found for account ${igAccountId} — automation cannot run`);
+    return;
+  }
+
+  // Resolve the actual message. Instagram (v23) frequently delivers a brand-new
+  // DM as a `message_edit` event carrying only a `mid` (no text/sender) — in that
+  // case fetch the message content by id and treat it as a normal message.
+  let m = messaging?.message || null;
+  let senderId = messaging?.sender?.id || null;
+  let recipientId = messaging?.recipient?.id || null;
+  const selfIds = [String(conn.igAccountId), String(conn.igUserId || "")].filter(Boolean);
+
+  if (!m && messaging?.message_edit?.mid) {
+    const mid = messaging.message_edit.mid;
+    console.log(`[webhook/instagram] fetching edit message mid=${mid} via ${graphBaseFor(conn)}`);
+    try {
+      const fetched = await fb({
+        method: "get",
+        url: `${graphBaseFor(conn)}/${mid}`,
+        params: { fields: "id,from,to,message,created_time" },
+        token: conn.pageAccessToken,
+      });
+      console.log(`[webhook/instagram] edit fetch raw:`, JSON.stringify(fetched));
+      if (fetched?.id) {
+        const fromId = fetched.from?.id ? String(fetched.from.id) : "";
+        m = { mid: fetched.id, text: fetched.message || "", is_echo: selfIds.includes(fromId), attachments: [] };
+        senderId = fromId || senderId;
+        recipientId = fetched.to?.data?.[0]?.id || recipientId;
+        console.log(`[webhook/instagram] resolved edit→message mid=${fetched.id} from=${fromId} echo=${m.is_echo} text="${m.text}"`);
+      }
+    } catch (e) {
+      console.warn(`[webhook/instagram] fetch message by mid failed: ${e.message}`);
+    }
+  }
+
+  if (!m || !m.mid) return; // reaction / read / unresolved — nothing to do
 
   // ---- Persist the DM so it shows in the inbox (both incoming and our echoes) ----
-  const m = messaging?.message;
-  if (m && m.mid) {
+  {
     const echo = !!m.is_echo;
-    const peerId = echo ? messaging?.recipient?.id : messaging?.sender?.id;
-    if (peerId && String(peerId) !== String(igAccountId)) {
+    const peerId = echo ? recipientId : senderId;
+    if (peerId && !selfIds.includes(String(peerId))) {
       const attachments = (m.attachments || []).map((a) => ({
         type: a.type || "file",
         url: a.payload?.url || "",
@@ -272,10 +318,9 @@ async function handleMessageEvent(igAccountId, messaging) {
   }
 
   // ---- Auto-reply / flows run only for genuine inbound messages ----
-  const senderId = messaging?.sender?.id;
-  const text = messaging?.message?.text || "";
-  const isEcho = messaging?.message?.is_echo;
-  if (!senderId || isEcho || senderId === igAccountId) return;
+  const text = m.text || "";
+  const isEcho = !!m.is_echo;
+  if (!senderId || isEcho || selfIds.includes(String(senderId))) return;
 
   // Settings-level default auto-reply (Instagram → Settings → "Auto-reply to new DMs").
   if (conn.settings?.dmAutoReply && String(conn.settings?.dmAutoReplyText || "").trim()) {
@@ -349,10 +394,14 @@ router.post("/", express.json(), async (req, res) => {
 
     for (const entry of body.entry || []) {
       const igAccountId = entry.id;
+      const changeFields = (entry.changes || []).map((c) => c.field);
+      console.log(`[webhook/instagram] entry account=${igAccountId} changes=[${changeFields.join(",")}] messaging=${(entry.messaging || []).length}`);
 
       for (const change of entry.changes || []) {
         if (change.field === "comments") {
           await handleCommentEvent(igAccountId, change.value);
+        } else {
+          console.log(`[webhook/instagram] (ignored change field: ${change.field})`);
         }
       }
 

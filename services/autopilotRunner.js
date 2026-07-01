@@ -213,6 +213,7 @@ async function runNode(node, payload, ctx = {}) {
           name: name || "", email: email ? email.toLowerCase() : "", phone: phone || "",
           source, status: "new",
         });
+        await require("./leadAssignment").autoAssignLead(lead);
       }
       return { step: stepOf(node, "ok", input, { id: String(lead._id), email: lead.email, name: lead.name, phone: lead.phone }, `Contact ${wasNew ? "created" : "updated"} → ${email || phone}`) };
     } catch (err) {

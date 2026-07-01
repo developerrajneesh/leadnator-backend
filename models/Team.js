@@ -9,6 +9,17 @@ const schema = new mongoose.Schema(
     name:  { type: String, required: true, trim: true },
     description: { type: String, default: "", trim: true },
     color: { type: String, default: "#7c3aed" },  // badge/tag color in the UI
+
+    // Auto-assignment config. When `enabled`, new leads routed to this team
+    // are round-robin distributed across `members` (empty = all active
+    // members of the team). `isDefault` marks the catch-all team used when no
+    // routing rule matches a new lead. `rrCursor` is the round-robin pointer.
+    autoAssign: {
+      enabled:   { type: Boolean, default: false },
+      isDefault: { type: Boolean, default: false },
+      members:   [{ type: mongoose.Schema.Types.ObjectId, ref: "TeamMember" }],
+    },
+    rrCursor: { type: Number, default: 0 },
   },
   {
     timestamps: true,

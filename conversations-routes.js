@@ -16,6 +16,18 @@ async function orgWaPhoneNumberId(req) {
   return conn?.phoneNumberId || null;
 }
 
+// Is the caller a team member restricted to only their assigned leads?
+function isRestricted(req) {
+  return !!(req.member && req.member.leadAccess === "assigned");
+}
+
+// Lead filter that also narrows to the member's assigned leads when restricted.
+function convoLeadFilter(req) {
+  const f = leadFilter(req);
+  if (isRestricted(req)) f.assignedTo = req.member._id;
+  return f;
+}
+
 const digits = (s) => String(s || "").replace(/\D/g, "");
 const preview = (s) =>
   String(s || "").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim().slice(0, 90);
@@ -45,8 +57,11 @@ router.get("/", async (req, res, next) => {
             { $group: { _id: "$contactPhone", last: { $first: "$$ROOT" }, ts: { $first: "$ts" } } },
           ])
         : Promise.resolve([]),
-      Lead.find(leadFilter(req)).select("name email phone").lean(),
+      Lead.find(convoLeadFilter(req)).select("name email phone").lean(),
     ]);
+    // Restricted members only see conversations tied to a lead assigned to them
+    // — never raw/unmatched threads for the whole workspace.
+    const restricted = isRestricted(req);
 
     const byEmail = {}, byPhone = {};
     for (const l of leads) {
@@ -63,6 +78,7 @@ router.get("/", async (req, res, next) => {
 
     for (const e of emailConvos) {
       const lead = byEmail[String(e._id || "").toLowerCase()];
+      if (!lead && restricted) continue;   // skip unmatched threads for restricted members
       const c = get(lead ? `lead:${lead._id}` : `raw:${e._id}`);
       if (lead) { c.name = lead.name; c.email = lead.email; c.phone = lead.phone; } else c.email = e._id;
       c.unread += e.unread || 0;
@@ -70,6 +86,7 @@ router.get("/", async (req, res, next) => {
     }
     for (const w of waConvos) {
       const lead = byPhone[digits(w._id)];
+      if (!lead && restricted) continue;   // skip unmatched threads for restricted members
       const c = get(lead ? `lead:${lead._id}` : `raw:${w._id}`);
       if (lead) { c.name = lead.name; c.email = lead.email; c.phone = lead.phone; } else c.phone = w._id;
       touch(c, w.ts, "whatsapp", w.last?.text);
@@ -86,11 +103,20 @@ router.get("/:id", async (req, res, next) => {
     const uid = req.user._id;
     const org = tenantId(req);
     const id = decodeURIComponent(req.params.id);
+    const restricted = isRestricted(req);
     let lead = null, email = "", phone = "";
     if (id.startsWith("lead:")) {
-      lead = await Lead.findOne({ ...leadFilter(req), _id: id.slice(5) }).lean();
+      lead = await Lead.findOne({ ...convoLeadFilter(req), _id: id.slice(5) }).lean();
+      // A restricted member asking for a lead that isn't theirs → empty thread.
+      if (!lead && restricted) {
+        return res.json({ id, contact: { name: "", email: "", phone: "", leadId: null }, messages: [] });
+      }
       email = lead?.email || ""; phone = lead?.phone || "";
     } else if (id.startsWith("raw:")) {
+      // Restricted members can only open conversations tied to their leads.
+      if (restricted) {
+        return res.status(403).json({ error: "You can only view conversations for leads assigned to you." });
+      }
       const v = id.slice(4);
       if (v.includes("@")) email = v; else phone = v;
     }

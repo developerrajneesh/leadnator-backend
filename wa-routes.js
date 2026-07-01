@@ -830,6 +830,25 @@ router.post("/phone-numbers/:id/register", requireWa, async (req, res, next) => 
   } catch (err) { next(err); }
 });
 
+// Deregister — deactivate Cloud API on a number (the "disconnect" for a single
+// number). Meta keeps the number on the WABA; it just goes back to DISCONNECTED
+// and can be re-registered later. This does NOT delete the number from Meta.
+router.post("/phone-numbers/:id/deregister", requireWa, async (req, res, next) => {
+  try {
+    const out = await fb({
+      method: "post",
+      url: `${FB_GRAPH_BASE}/${req.params.id}/deregister`,
+      data: { messaging_product: "whatsapp" },
+      token: req.wa.accessToken,
+    });
+    res.json({ ok: true, raw: out });
+  } catch (err) {
+    const friendly = friendlyWaSendError(err);
+    if (friendly) return res.status(400).json({ error: friendly, code: err?.fb?.code });
+    next(err);
+  }
+});
+
 // ---------- TEMPLATES ----------
 router.get("/templates", requireWa, async (req, res, next) => {
   try {
@@ -851,12 +870,61 @@ router.post("/templates", requireWa, async (req, res, next) => {
     if (!req.wa.businessAccountId) {
       return res.status(400).json({ error: "WABA ID required to create templates." });
     }
-    const { name, language = "en_US", category = "MARKETING", body, header, footer, buttons } = req.body || {};
+    const { name, language = "en_US", category = "MARKETING", body, header, footer, buttons, namedParams, bodyExample } = req.body || {};
     if (!name || !body) return res.status(400).json({ error: "name and body are required" });
 
+    // Meta REJECTS any template whose text has {{placeholders}} but no sample
+    // values, and requires parameter_format to match the placeholder style.
+    // We detect the tokens, decide NAMED vs POSITIONAL, and attach examples
+    // (from the caller's namedParams, else a sensible auto-generated sample).
+    const TOKEN_RE = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
+    const sampleFor = (token) => {
+      const map = Array.isArray(namedParams)
+        ? Object.fromEntries(namedParams.map((p) => [String(p.name || "").replace(/[{}]/g, "").trim(), p.example]))
+        : {};
+      if (map[token]) return String(map[token]);
+      const t = token.toLowerCase();
+      if (/otp|code|pin/.test(t)) return "123456";
+      if (/name/.test(t)) return "Alex";
+      if (/order|invoice|ref|id|number/.test(t)) return "#12345";
+      if (/date|day|expiry|valid|deadline/.test(t)) return "12 May 2026";
+      if (/time/.test(t)) return "3:00 PM";
+      if (/amount|price|total|savings|discount|offer/.test(t)) return "₹499";
+      if (/url|link|track/.test(t)) return "https://example.com";
+      if (/minute/.test(t)) return "10";
+      return "Sample";
+    };
+    const tokensOf = (text) => [...String(text || "").matchAll(TOKEN_RE)].map((m) => m[1]);
+    const bodyTokens = tokensOf(body);
+    const isNamed = bodyTokens.some((t) => /[a-zA-Z_]/.test(t));
+    const parameterFormat = bodyTokens.length ? (isNamed ? "NAMED" : "POSITIONAL") : null;
+
     const components = [];
-    if (header) components.push({ type: "HEADER", format: "TEXT", text: header });
-    components.push({ type: "BODY", text: body });
+
+    if (header) {
+      const headerComp = { type: "HEADER", format: "TEXT", text: header };
+      const hTokens = tokensOf(header);
+      if (hTokens.length) {
+        headerComp.example = isNamed
+          ? { header_text_named_params: hTokens.map((t) => ({ param_name: t, example: sampleFor(t) })) }
+          : { header_text: [sampleFor(hTokens[0])] };
+      }
+      components.push(headerComp);
+    }
+
+    const bodyComp = { type: "BODY", text: body };
+    if (bodyTokens.length) {
+      if (isNamed) {
+        bodyComp.example = { body_text_named_params: bodyTokens.map((t) => ({ param_name: t, example: sampleFor(t) })) };
+      } else {
+        // Positional: one array of samples, in {{1}},{{2}}… order.
+        const ordered = [...new Set(bodyTokens)].sort((a, b) => Number(a) - Number(b));
+        const vals = Array.isArray(bodyExample) && bodyExample.length ? bodyExample : ordered.map((t) => sampleFor(t));
+        bodyComp.example = { body_text: [vals] };
+      }
+    }
+    components.push(bodyComp);
+
     if (footer) components.push({ type: "FOOTER", text: footer });
     if (Array.isArray(buttons) && buttons.length) {
       // Buttons can be strings (quick replies, legacy) OR objects with explicit type:
@@ -876,12 +944,19 @@ router.post("/templates", requireWa, async (req, res, next) => {
       components.push({ type: "BUTTONS", buttons: normalized });
     }
 
+    const payload = { name, language, category, components };
+    if (parameterFormat) payload.parameter_format = parameterFormat;
+
     const data = await fb({
       method: "post",
       url: `${FB_GRAPH_BASE}/${req.wa.businessAccountId}/message_templates`,
-      data: { name, language, category, components },
+      data: payload,
       token: req.wa.accessToken,
     });
+    if (data?.error) {
+      const friendly = data.error.error_user_msg || data.error.message || "Template creation failed";
+      return res.status(400).json({ error: friendly, code: data.error.code, fb: data.error });
+    }
     res.status(201).json({ template: data });
   } catch (err) { next(err); }
 });
@@ -1602,8 +1677,12 @@ router.get("/conversations", async (req, res, next) => {
       { $sort: { lastTs: -1 } },
     ]);
     const phones = agg.map((a) => a._id);
+    // Contacts are matched by user + line only. The message `match` carries a
+    // `ts >= inboxSince` filter which WhatsAppContact has no field for, so
+    // spreading it here would match zero contacts and drop every saved name.
+    const { ts: _ts, ...contactMatch } = match; // eslint-disable-line no-unused-vars
     const contacts = await WhatsAppContact
-      .find({ ...match, phone: { $in: phones } })
+      .find({ ...contactMatch, phone: { $in: phones } })
       .populate("labels");
     const byPhone = Object.fromEntries(contacts.map((c) => [c.phone, c]));
 
@@ -2287,6 +2366,346 @@ router.post("/chatbots/:id/simulate", async (req, res, next) => {
     if (start && !lower) return res.json({ match: "start", step: start });
 
     return res.json({ match: "fallback", fallback: bot.fallback });
+  } catch (err) { next(err); }
+});
+
+// ============================================================================
+// ICE BREAKERS — conversational_automation "prompts" on a phone number.
+// Ice breakers are the tappable question chips shown when a user opens a chat
+// for the first time. They are configured PER PHONE NUMBER (not per WABA), so
+// each connected number can have its own set (max 4, each ≤ 80 chars).
+//   Read:  GET  /{phone-number-id}?fields=conversational_automation
+//   Write: POST /{phone-number-id}/conversational_automation
+// ============================================================================
+
+// Resolve which phone number id to act on: an explicit one (must belong to the
+// connected WABA in a real multi-number setup) or the connected number.
+function resolveIceBreakerPhoneId(req) {
+  return String(req.query.phoneNumberId || req.body?.phoneNumberId || req.wa.phoneNumberId || "").trim();
+}
+
+router.get("/ice-breakers", requireWa, async (req, res, next) => {
+  try {
+    const phoneNumberId = resolveIceBreakerPhoneId(req);
+    if (!phoneNumberId) return res.status(400).json({ error: "No phone number id" });
+    const out = await fb({
+      method: "get",
+      url: `${FB_GRAPH_BASE}/${phoneNumberId}`,
+      params: { fields: "conversational_automation" },
+      token: req.wa.accessToken,
+    });
+    const ca = out?.conversational_automation || {};
+    res.json({
+      phoneNumberId,
+      iceBreakers: Array.isArray(ca.prompts) ? ca.prompts : [],
+      enableWelcome: !!ca.enable_welcome_message,
+      commands: Array.isArray(ca.commands) ? ca.commands : [],
+    });
+  } catch (err) {
+    const friendly = friendlyWaSendError(err);
+    if (friendly) return res.status(400).json({ error: friendly, code: err?.fb?.code });
+    next(err);
+  }
+});
+
+router.post("/ice-breakers", requireWa, async (req, res, next) => {
+  try {
+    const phoneNumberId = resolveIceBreakerPhoneId(req);
+    if (!phoneNumberId) return res.status(400).json({ error: "No phone number id" });
+
+    // Sanitise: trim, drop empties, cap at 4 prompts / 80 chars each (Meta limits).
+    const prompts = (Array.isArray(req.body?.prompts) ? req.body.prompts : [])
+      .map((p) => String(p || "").trim())
+      .filter(Boolean)
+      .slice(0, 4)
+      .map((p) => p.slice(0, 80));
+
+    // Preserve any existing commands unless the caller explicitly sends new ones.
+    let commands = Array.isArray(req.body?.commands) ? req.body.commands : null;
+    if (!commands) {
+      try {
+        const cur = await fb({
+          method: "get",
+          url: `${FB_GRAPH_BASE}/${phoneNumberId}`,
+          params: { fields: "conversational_automation" },
+          token: req.wa.accessToken,
+        });
+        commands = cur?.conversational_automation?.commands || [];
+      } catch { commands = []; }
+    }
+
+    const out = await fb({
+      method: "post",
+      url: `${FB_GRAPH_BASE}/${phoneNumberId}/conversational_automation`,
+      data: {
+        enable_welcome_message: typeof req.body?.enableWelcome === "boolean" ? req.body.enableWelcome : prompts.length > 0,
+        prompts,
+        commands,
+      },
+      token: req.wa.accessToken,
+    });
+    res.json({ ok: true, phoneNumberId, iceBreakers: prompts, raw: out });
+  } catch (err) {
+    const friendly = friendlyWaSendError(err);
+    if (friendly) return res.status(400).json({ error: friendly, code: err?.fb?.code });
+    next(err);
+  }
+});
+
+// ============================================================================
+// CATALOG — Meta Commerce product catalogs for WhatsApp.
+// A catalog lives under the Meta Business (business_id). Products can then be
+// showcased in the chat as catalog / product messages.
+//   List:   GET  /{business-id}/owned_product_catalogs
+//   Create: POST /{business-id}/owned_product_catalogs   { name }
+//   Products: GET/POST /{catalog-id}/products
+// ============================================================================
+function businessIdOf(req) {
+  return String(req.wa.businessId || "").trim();
+}
+
+router.get("/catalogs", requireWa, async (req, res, next) => {
+  try {
+    const business = businessIdOf(req);
+    if (!business) return res.json({ catalogs: [], businessId: "", needsBusiness: true });
+    const out = await fb({
+      method: "get",
+      url: `${FB_GRAPH_BASE}/${business}/owned_product_catalogs`,
+      params: { fields: "name,product_count,vertical" },
+      token: req.wa.accessToken,
+    });
+    res.json({ catalogs: out?.data || [], businessId: business });
+  } catch (err) {
+    const f = friendlyWaSendError(err);
+    if (f) return res.status(400).json({ error: f, code: err?.fb?.code });
+    next(err);
+  }
+});
+
+router.post("/catalogs", requireWa, async (req, res, next) => {
+  try {
+    const business = businessIdOf(req);
+    if (!business) return res.status(400).json({ error: "No Meta Business ID is linked to this WhatsApp account. Reconnect via Embedded Signup to enable catalogs." });
+    const name = String(req.body?.name || "").trim();
+    if (!name) return res.status(400).json({ error: "Catalog name is required." });
+    const out = await fb({
+      method: "post",
+      url: `${FB_GRAPH_BASE}/${business}/owned_product_catalogs`,
+      data: { name },
+      token: req.wa.accessToken,
+    });
+    res.json({ ok: true, id: out?.id || "", raw: out });
+  } catch (err) {
+    const f = friendlyWaSendError(err);
+    if (f) return res.status(400).json({ error: f, code: err?.fb?.code });
+    next(err);
+  }
+});
+
+router.get("/catalogs/:id/products", requireWa, async (req, res, next) => {
+  try {
+    const out = await fb({
+      method: "get",
+      url: `${FB_GRAPH_BASE}/${req.params.id}/products`,
+      params: { fields: "name,price,currency,image_url,availability,retailer_id,url,description", limit: 100 },
+      token: req.wa.accessToken,
+    });
+    res.json({ products: out?.data || [] });
+  } catch (err) {
+    const f = friendlyWaSendError(err);
+    if (f) return res.status(400).json({ error: f, code: err?.fb?.code });
+    next(err);
+  }
+});
+
+router.post("/catalogs/:id/products", requireWa, async (req, res, next) => {
+  try {
+    const { name, price, currency, retailerId, imageUrl, url, description, availability } = req.body || {};
+    if (!String(name || "").trim()) return res.status(400).json({ error: "Product name is required." });
+    if (!String(imageUrl || "").trim()) return res.status(400).json({ error: "A product image URL is required." });
+    const amount = Math.round(parseFloat(price || 0) * 100); // Meta expects the price in minor units (cents/paise).
+    if (!Number.isFinite(amount) || amount < 0) return res.status(400).json({ error: "Enter a valid price." });
+
+    const data = {
+      retailer_id: String(retailerId || "").trim() || `sku_${Date.now()}`,
+      name: String(name).trim(),
+      price: amount,
+      currency: String(currency || "INR").toUpperCase(),
+      image_url: String(imageUrl).trim(),
+      availability: availability || "in stock",
+    };
+    if (url) data.url = String(url).trim();
+    if (description) data.description = String(description).trim();
+
+    const out = await fb({
+      method: "post",
+      url: `${FB_GRAPH_BASE}/${req.params.id}/products`,
+      data,
+      token: req.wa.accessToken,
+    });
+    res.json({ ok: true, id: out?.id || "", raw: out });
+  } catch (err) {
+    const f = friendlyWaSendError(err);
+    if (f) return res.status(400).json({ error: f, code: err?.fb?.code });
+    next(err);
+  }
+});
+
+// ============================================================================
+// CALLING — WhatsApp Business Calling API (WebRTC voice calls)
+//
+// All signaling actions hit a single Graph endpoint:
+//   POST /{phone-number-id}/calls  with { action, session:{sdp, sdp_type}, ... }
+// The browser (CallingClient) does the actual WebRTC media; these routes just
+// relay SDP + control actions to Meta. Real-time call events arrive via the
+// webhook (field="calls") and are pushed to the client over Socket.IO ("wa.call").
+// ============================================================================
+
+// POST /{phoneNumberId}/calls action wrapper.
+async function callAction(conn, body) {
+  return fb({
+    method: "post",
+    url: `${FB_GRAPH_BASE}/${conn.phoneNumberId}/calls`,
+    data: { messaging_product: "whatsapp", ...body },
+    token: conn.accessToken,
+  });
+}
+
+// Outbound: initiate a call. Body: { to, sdp, sdpType }. Returns { callId }.
+router.post("/calls/connect", requireWa, async (req, res, next) => {
+  try {
+    const { to, sdp, sdpType } = req.body || {};
+    if (!to || !sdp) return res.status(400).json({ error: "to and sdp required" });
+    const result = await callAction(req.wa, {
+      to, action: "connect", session: { sdp, sdp_type: sdpType || "offer" },
+    });
+    res.json({ status: "ok", callId: result?.calls?.[0]?.id || "" });
+  } catch (err) {
+    const friendly = friendlyWaSendError(err);
+    if (friendly) return res.status(400).json({ error: friendly, code: err?.fb?.code });
+    next(err);
+  }
+});
+
+// Inbound phase 1: pre-accept (start media negotiation). Body: { callId, sdp, sdpType }.
+router.post("/calls/pre-accept", requireWa, async (req, res, next) => {
+  try {
+    const { callId, sdp, sdpType } = req.body || {};
+    if (!callId || !sdp) return res.status(400).json({ error: "callId and sdp required" });
+    const result = await callAction(req.wa, {
+      call_id: callId, action: "pre_accept", session: { sdp, sdp_type: sdpType || "answer" },
+    });
+    res.json({ status: "ok", data: result });
+  } catch (err) { next(err); }
+});
+
+// Inbound phase 2: accept (once WebRTC connected). Body: { callId, sdp, sdpType }.
+router.post("/calls/accept", requireWa, async (req, res, next) => {
+  try {
+    const { callId, sdp, sdpType } = req.body || {};
+    if (!callId || !sdp) return res.status(400).json({ error: "callId and sdp required" });
+    const result = await callAction(req.wa, {
+      call_id: callId, action: "accept", session: { sdp, sdp_type: sdpType || "answer" },
+    });
+    res.json({ status: "ok", data: result });
+  } catch (err) { next(err); }
+});
+
+// Reject an incoming call. Body: { callId }.
+router.post("/calls/reject", requireWa, async (req, res, next) => {
+  try {
+    const { callId } = req.body || {};
+    if (!callId) return res.status(400).json({ error: "callId required" });
+    const result = await callAction(req.wa, { call_id: callId, action: "reject" });
+    res.json({ status: "ok", data: result });
+  } catch (err) { next(err); }
+});
+
+// Hang up / terminate an active or ringing call. Body: { callId }.
+router.post("/calls/terminate", requireWa, async (req, res, next) => {
+  try {
+    const { callId } = req.body || {};
+    if (!callId) return res.status(400).json({ error: "callId required" });
+    const result = await callAction(req.wa, { call_id: callId, action: "terminate" });
+    res.json({ status: "ok", data: result });
+  } catch (err) { next(err); }
+});
+
+// Check whether we're allowed to call a given consumer.
+// GET /wa/calls/permissions?userWaId=<phone>
+router.get("/calls/permissions", requireWa, async (req, res, next) => {
+  try {
+    const userWaId = req.query.userWaId;
+    if (!userWaId) return res.status(400).json({ error: "userWaId required" });
+    const result = await fb({
+      method: "get",
+      url: `${FB_GRAPH_BASE}/${req.wa.phoneNumberId}/call_permissions`,
+      params: { user_wa_id: userWaId },
+      token: req.wa.accessToken,
+    });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+// Ask the consumer for permission to call them (interactive message).
+// Body: { to, bodyText? }.
+router.post("/calls/request-permission", requireWa, async (req, res, next) => {
+  try {
+    const { to, bodyText } = req.body || {};
+    if (!to) return res.status(400).json({ error: "to required" });
+    const result = await fb({
+      method: "post",
+      url: `${FB_GRAPH_BASE}/${req.wa.phoneNumberId}/messages`,
+      data: {
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to,
+        type: "interactive",
+        interactive: {
+          type: "call_permission_request",
+          body: { text: bodyText || "May we call you about your enquiry?" },
+          action: { name: "call_permission_request" },
+        },
+      },
+      token: req.wa.accessToken,
+    });
+    res.json({ status: "ok", data: result });
+  } catch (err) {
+    const friendly = friendlyWaSendError(err);
+    if (friendly) return res.status(400).json({ error: friendly, code: err?.fb?.code });
+    next(err);
+  }
+});
+
+// Read current calling settings for the connected number.
+router.get("/calls/settings", requireWa, async (req, res, next) => {
+  try {
+    const result = await fb({
+      method: "get",
+      url: `${FB_GRAPH_BASE}/${req.wa.phoneNumberId}/settings`,
+      token: req.wa.accessToken,
+    });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+// Enable/disable calling on the connected number. Body: { enabled: boolean }.
+router.post("/calls/settings", requireWa, async (req, res, next) => {
+  try {
+    const { enabled } = req.body || {};
+    if (typeof enabled !== "boolean") return res.status(400).json({ error: "enabled (boolean) required" });
+    const result = await fb({
+      method: "post",
+      url: `${FB_GRAPH_BASE}/${req.wa.phoneNumberId}/settings`,
+      data: {
+        calling: {
+          status: enabled ? "ENABLED" : "DISABLED",
+          callback_permission_status: enabled ? "ENABLED" : "DISABLED",
+        },
+      },
+      token: req.wa.accessToken,
+    });
+    res.json({ status: "ok", data: result });
   } catch (err) { next(err); }
 });
 

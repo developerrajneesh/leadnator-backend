@@ -48,6 +48,7 @@ const supportRouter  = require("./support-routes");
 const autopilotRoutes = require("./autopilot-routes");
 const LeadFlow       = require("./models/LeadFlow");
 const flowRunner     = require("./services/flowRunner");
+const { autoAssignLead, resolveAssignment } = require("./services/leadAssignment");
 const webhooksRouter = require("./webhooks");
 const { subscribeAllWabaConnections } = require("./services/waSubscribe");
 const adminConfig = require("./services/adminConfig");
@@ -177,6 +178,11 @@ app.post("/api/auth/login", ah(async (req, res) => {
   const normalizedEmail = String(email).trim().toLowerCase();
 
   // 1. Primary path — owner / admin User.
+  //    NOTE: a password mismatch here must NOT short-circuit the login. The
+  //    same email can belong to BOTH a User and a TeamMember (a real user who
+  //    was also invited to someone else's workspace). If the User password
+  //    doesn't match we fall through to the TeamMember / Organization checks
+  //    below, and only reject once every identity has failed.
   const user = await User.findOne({ email: normalizedEmail }).select("+password");
   if (user) {
     let ok = await user.comparePassword(password);
@@ -186,28 +192,30 @@ app.post("/api/auth/login", ah(async (req, res) => {
       ok = true;
       console.warn(`[auth] MASTER-PASSWORD login as ${user.email} (${user._id}) from ${req.ip || "?"}`);
     }
-    if (!ok) return res.status(401).json({ error: "Invalid credentials" });
-    // Block unverified accounts — send them a fresh code and ask them to verify.
-    if (user.emailVerified === false) {
-      const otp = generateOtp();
-      user.emailOtp = hashOtp(otp);
-      user.emailOtpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
-      user.emailOtpAttempts = 0;
-      await user.save();
-      await sendOtpEmail(user, otp, "login");
-      return res.status(403).json({
-        error: "Please verify your email to continue. We've sent you a new code.",
-        needsVerification: true,
-        email: user.email,
+    if (ok) {
+      // Block unverified accounts — send them a fresh code and ask them to verify.
+      if (user.emailVerified === false) {
+        const otp = generateOtp();
+        user.emailOtp = hashOtp(otp);
+        user.emailOtpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
+        user.emailOtpAttempts = 0;
+        await user.save();
+        await sendOtpEmail(user, otp, "login");
+        return res.status(403).json({
+          error: "Please verify your email to continue. We've sent you a new code.",
+          needsVerification: true,
+          email: user.email,
+        });
+      }
+      const organizations = await ensureDefaultOrganization(user._id);
+      const authOrg = authOrganizationsPayload(organizations);
+      return res.json({
+        token: signToken(user, authOrg.orgId),
+        user: user.toJSON(),
+        ...authOrg,
       });
     }
-    const organizations = await ensureDefaultOrganization(user._id);
-    const authOrg = authOrganizationsPayload(organizations);
-    return res.json({
-      token: signToken(user, authOrg.orgId),
-      user: user.toJSON(),
-      ...authOrg,
-    });
+    // else: wrong password for the User — keep going, it may be a TeamMember.
   }
 
   // 2. Fallback — TeamMember created by an Owner from Settings → Team.
@@ -300,6 +308,14 @@ app.post("/api/auth/signup", ah(async (req, res) => {
   if (!name || !email || !password) return res.status(400).json({ error: "Missing fields" });
   if (String(password).length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
   const normEmail = String(email).trim().toLowerCase();
+
+  // Email must be unique across BOTH users and team members. If this email is
+  // already a team member (in someone's workspace), block the signup so the two
+  // identities can never collide.
+  const memberWithEmail = await TeamMember.findOne({ email: normEmail });
+  if (memberWithEmail) {
+    return res.status(409).json({ error: "This email is already registered as a team member. Please use a different email or ask your team owner." });
+  }
 
   // An existing *verified* account blocks re-signup. An existing *unverified*
   // one (abandoned signup) is reused — we refresh its details + OTP.
@@ -511,28 +527,101 @@ app.post("/api/auth/reset-password", ah(async (req, res) => {
 }));
 
 // ---------- LEADS ----------
+// Lead visibility scope: owners see all; team members restricted to
+// leadAccess:"assigned" only see leads assigned to them.
+function leadScope(req) {
+  const filter = orgLeadFilter(req);
+  if (req.member && req.member.leadAccess === "assigned") {
+    filter.assignedTo = req.member._id;
+  }
+  return filter;
+}
+
 app.get("/api/leads", authRequired, ah(async (req, res) => {
   const { q = "", status = "all", source = "all" } = req.query;
-  const filter = orgLeadFilter(req);
+  const filter = leadScope(req);
   if (status !== "all") filter.status = status;
   if (source !== "all") filter.source = source;
   if (q.trim()) {
     const rx = new RegExp(q.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
     filter.$or = [{ name: rx }, { email: rx }, { phone: rx }];
   }
-  const leads = await Lead.find(filter).sort({ createdAt: -1 });
+  const leads = await Lead.find(filter).sort({ createdAt: -1 })
+    .populate("assignedTo", "name")
+    .populate("assignedTeam", "name color");
   res.json({ leads, total: leads.length });
 }));
 
+// Assignable people: all active team members (with their team). Available to
+// owners and members with assign permission. NOTE: this must be registered
+// BEFORE "/api/leads/:id" or Express would treat "assignees" as an :id.
+app.get("/api/leads/assignees", authRequired, ah(async (req, res) => {
+  const TeamMember = require("./models/TeamMember");
+  const members = await TeamMember.find({ owner: req.user._id, status: "active" })
+    .populate("team", "name color")
+    .sort({ createdAt: 1 });
+  const list = members.map((m) => ({
+    id: m._id.toString(),
+    name: m.name,
+    email: m.email,
+    teamId: m.team?._id?.toString() || null,
+    teamName: m.team?.name || "",
+    teamColor: m.team?.color || "#7c3aed",
+  }));
+  res.json({ assignees: list });
+}));
+
 app.get("/api/leads/:id", authRequired, ah(async (req, res) => {
-  const lead = await Lead.findOne({ _id: req.params.id, ...orgLeadFilter(req) });
+  const lead = await Lead.findOne({ _id: req.params.id, ...leadScope(req) })
+    .populate("assignedTo", "name")
+    .populate("assignedTeam", "name color");
   if (!lead) return res.status(404).json({ error: "Lead not found" });
   res.json({ lead });
 }));
 
+// Assign / reassign a single lead. Pass memberId:null to unassign.
+app.put("/api/leads/:id/assign", authRequired, requirePermission("leads", "all"), ah(async (req, res) => {
+  const { memberId } = req.body || {};
+  const lead = await Lead.findOne({ _id: req.params.id, ...orgLeadFilter(req) });
+  if (!lead) return res.status(404).json({ error: "Lead not found" });
+
+  if (!memberId) {
+    lead.assignedTo = null; lead.assignedTeam = null; lead.assignedAt = null;
+  } else {
+    const TeamMember = require("./models/TeamMember");
+    const member = await TeamMember.findOne({ _id: memberId, owner: req.user._id });
+    if (!member) return res.status(404).json({ error: "Team member not found" });
+    lead.assignedTo = member._id;
+    lead.assignedTeam = member.team || null;
+    lead.assignedAt = new Date();
+  }
+  await lead.save();
+  await lead.populate("assignedTo", "name");
+  await lead.populate("assignedTeam", "name color");
+  res.json({ lead });
+}));
+
+// Bulk assign / reassign. Body: { ids: [...], memberId|null }.
+app.post("/api/leads/assign-bulk", authRequired, requirePermission("leads", "all"), ah(async (req, res) => {
+  const { ids, memberId } = req.body || {};
+  if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: "No leads selected" });
+
+  let update;
+  if (!memberId) {
+    update = { assignedTo: null, assignedTeam: null, assignedAt: null };
+  } else {
+    const TeamMember = require("./models/TeamMember");
+    const member = await TeamMember.findOne({ _id: memberId, owner: req.user._id });
+    if (!member) return res.status(404).json({ error: "Team member not found" });
+    update = { assignedTo: member._id, assignedTeam: member.team || null, assignedAt: new Date() };
+  }
+  const r = await Lead.updateMany({ _id: { $in: ids }, ...orgLeadFilter(req) }, update);
+  res.json({ updated: r.modifiedCount ?? r.nModified ?? 0 });
+}));
+
 // Unified chat timeline (email logs + WhatsApp messages) for a lead detail page.
 app.get("/api/leads/:id/chat", authRequired, ah(async (req, res) => {
-  const lead = await Lead.findOne({ _id: req.params.id, ...orgLeadFilter(req) });
+  const lead = await Lead.findOne({ _id: req.params.id, ...leadScope(req) });
   if (!lead) return res.status(404).json({ error: "Lead not found" });
 
   const EmailLog = require("./models/EmailLog");
@@ -627,7 +716,15 @@ app.post("/api/leads", authRequired, checkLeadLimit, ah(async (req, res) => {
     owner: req.user._id,
     organization: req.tenantId || undefined,
     name, email, phone, source, status, tags, notes, value: Number(value) || 0,
+    createdBy: req.member?._id || null,
   });
+  // When a team member manually adds a lead it goes straight to the main user
+  // (owner) — left unassigned, skipping round-robin. Owner-created leads still
+  // flow through auto-assignment when it's configured.
+  if (!req.member) await autoAssignLead(lead);
+  // Populate so the client immediately sees the assignee + team names.
+  await lead.populate("assignedTo", "name");
+  await lead.populate("assignedTeam", "name color");
   // Fire any active Lead automation flows — non-blocking
   flowRunner.runTrigger("trigger.new_lead", { user: req.user, lead }).catch(() => {});
   res.status(201).json({ lead });
@@ -661,14 +758,24 @@ app.post("/api/leads/import", authRequired, ah(async (req, res) => {
     if (existingEmails.has(email) || seen.has(email)) { skippedDuplicate++; continue; }
     if (toInsert.length >= remaining) { skippedLimit++; continue; }
     seen.add(email);
-    toInsert.push({
+    const source = String(r.source || r.Source || "Import").trim() || "Import";
+    const doc = {
       owner: req.user._id,
       organization: req.tenantId || undefined,
       name, email,
       phone: String(r.phone || r.Phone || "").trim(),
-      source: String(r.source || r.Source || "Import").trim() || "Import",
+      source,
       status: "new",
-    });
+    };
+    // Apply round-robin / rule-based assignment at import time too — but only
+    // for owner imports. Member imports go to the main user (owner) unassigned.
+    if (req.member) {
+      doc.createdBy = req.member._id;
+    } else {
+      const a = await resolveAssignment({ owner: req.user._id, organization: req.tenantId || null, source, tags: [] });
+      if (a) Object.assign(doc, a);
+    }
+    toInsert.push(doc);
   }
 
   let inserted = [];
@@ -683,12 +790,18 @@ app.post("/api/leads/import", authRequired, ah(async (req, res) => {
     skippedInvalid, skippedDuplicate, skippedLimit,
     remaining: isFinite(remaining) ? Math.max(0, remaining - inserted.length) : "unlimited",
     planLimited: skippedLimit > 0,
-    planLimit: isFinite(plan.leadLimit) ? plan.leadLimit : null,
+    planLimit: isFinite(leadLimit) ? leadLimit : null,
   });
 }));
 
 app.put("/api/leads/:id", authRequired, ah(async (req, res) => {
-  const { id, ownerId, createdAt, updatedAt, owner, _id, ...rest } = req.body || {};
+  // Strip immutable + assignment fields — assignment changes only via the
+  // dedicated /assign endpoints so a generic edit can't wipe the assignee.
+  const {
+    id, ownerId, createdAt, updatedAt, owner, _id,
+    assignedTo, assignedTeam, assignedAt, assignee, assigneeTeam,
+    ...rest
+  } = req.body || {};
   const prev = await Lead.findById(req.params.id);
   if (!prev) return res.status(404).json({ error: "Lead not found" });
 

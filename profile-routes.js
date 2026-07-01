@@ -5,6 +5,7 @@ const UserSettings = require("./models/UserSettings");
 const ApiKey = require("./models/ApiKey");
 const TeamMember = require("./models/TeamMember");
 const Team = require("./models/Team");
+const AssignmentRule = require("./models/AssignmentRule");
 const { ownerOnly } = require("./middleware/auth");
 
 const router = express.Router();
@@ -16,6 +17,19 @@ const router = express.Router();
 router.use("/api-keys", ownerOnly);
 router.use("/teams",    ownerOnly);
 router.use("/team",     ownerOnly);
+router.use("/assignment-rules", ownerOnly);
+
+// Normalise an incoming auto-assign config into the shape Team expects.
+function cleanAutoAssign(input) {
+  if (!input || typeof input !== "object") return undefined;
+  const out = {};
+  if (typeof input.enabled === "boolean") out.enabled = input.enabled;
+  if (typeof input.isDefault === "boolean") out.isDefault = input.isDefault;
+  if (Array.isArray(input.members)) {
+    out.members = input.members.filter((x) => /^[a-f0-9]{24}$/i.test(String(x)));
+  }
+  return out;
+}
 
 // ---------- USER PROFILE (info) ----------
 router.put("/info", async (req, res, next) => {
@@ -57,13 +71,40 @@ router.get("/settings", async (req, res, next) => {
   try {
     let s = await UserSettings.findOne({ user: req.user._id });
     if (!s) s = await UserSettings.create({ user: req.user._id });
-    res.json({ settings: s });
+    const json = s.toJSON();
+    // Team members keep their OWN table-column prefs, separate from the owner
+    // (and from each other) — overlay them onto the shared settings payload.
+    if (req.member) {
+      json.leadColumns = req.member.leadColumns || [];
+      json.leadCardFields = req.member.leadCardFields || [];
+    }
+    res.json({ settings: json });
   } catch (err) { next(err); }
 });
 
 router.put("/settings", async (req, res, next) => {
   try {
     const { _id, id, user, ...patch } = req.body || {};
+
+    // For a team member, table-column prefs are stored on THEIR own doc — the
+    // owner's settings are never touched. Other (owner-level) settings sent by
+    // a member are ignored.
+    if (req.member) {
+      const memberPatch = {};
+      if (Array.isArray(patch.leadColumns))    memberPatch.leadColumns = patch.leadColumns;
+      if (Array.isArray(patch.leadCardFields)) memberPatch.leadCardFields = patch.leadCardFields;
+      if (Object.keys(memberPatch).length) {
+        await TeamMember.updateOne({ _id: req.member._id, owner: req.user._id }, { $set: memberPatch });
+        Object.assign(req.member, memberPatch);
+      }
+      let s = await UserSettings.findOne({ user: req.user._id });
+      if (!s) s = await UserSettings.create({ user: req.user._id });
+      const json = s.toJSON();
+      json.leadColumns = req.member.leadColumns || [];
+      json.leadCardFields = req.member.leadCardFields || [];
+      return res.json({ settings: json });
+    }
+
     const s = await UserSettings.findOneAndUpdate(
       { user: req.user._id }, { ...patch, user: req.user._id },
       { new: true, upsert: true, setDefaultsOnInsert: true, runValidators: true }
@@ -157,14 +198,20 @@ router.get("/teams/:id", async (req, res, next) => {
 
 router.post("/teams", async (req, res, next) => {
   try {
-    const { name, description = "", color = "#7c3aed" } = req.body || {};
+    const { name, description = "", color = "#7c3aed", autoAssign } = req.body || {};
     if (!name?.trim()) return res.status(400).json({ error: "Team name is required" });
+    const aa = cleanAutoAssign(autoAssign);
     const t = await Team.create({
       owner: req.user._id,
       name: name.trim(),
       description: description.trim(),
       color,
+      ...(aa ? { autoAssign: aa } : {}),
     });
+    // Only one catch-all default team per owner.
+    if (aa?.isDefault) {
+      await Team.updateMany({ owner: req.user._id, _id: { $ne: t._id } }, { "autoAssign.isDefault": false });
+    }
     res.status(201).json({ team: t.toJSON() });
   } catch (err) {
     if (err.code === 11000) return res.status(409).json({ error: "You already have a team with that name." });
@@ -174,17 +221,27 @@ router.post("/teams", async (req, res, next) => {
 
 router.put("/teams/:id", async (req, res, next) => {
   try {
-    const { name, description, color } = req.body || {};
+    const { name, description, color, autoAssign } = req.body || {};
     const update = {};
     if (typeof name === "string" && name.trim()) update.name = name.trim();
     if (typeof description === "string") update.description = description.trim();
     if (typeof color === "string") update.color = color;
+    const aa = cleanAutoAssign(autoAssign);
+    if (aa) {
+      if (typeof aa.enabled === "boolean") update["autoAssign.enabled"] = aa.enabled;
+      if (typeof aa.isDefault === "boolean") update["autoAssign.isDefault"] = aa.isDefault;
+      if (Array.isArray(aa.members)) update["autoAssign.members"] = aa.members;
+    }
     const t = await Team.findOneAndUpdate(
       { _id: req.params.id, owner: req.user._id },
       update,
       { new: true, runValidators: true }
     );
     if (!t) return res.status(404).json({ error: "Team not found" });
+    // Keep a single catch-all default across the owner's teams.
+    if (aa?.isDefault) {
+      await Team.updateMany({ owner: req.user._id, _id: { $ne: t._id } }, { "autoAssign.isDefault": false });
+    }
     res.json({ team: t.toJSON() });
   } catch (err) {
     if (err.code === 11000) return res.status(409).json({ error: "You already have a team with that name." });
@@ -251,6 +308,15 @@ router.post("/team", async (req, res, next) => {
     const team = await Team.findOne({ _id: teamId, owner: req.user._id });
     if (!team) return res.status(404).json({ error: "Team not found" });
 
+    // Email must be unique across BOTH users and team members. If a Leadnator
+    // user account already owns this email, it can't also be a team member —
+    // otherwise the two identities collide at login.
+    const normEmail = email.trim().toLowerCase();
+    const userWithEmail = await User.findOne({ email: normEmail });
+    if (userWithEmail) {
+      return res.status(409).json({ error: "That email already has a Leadnator user account — it can't also be added as a team member. Use a different email." });
+    }
+
     // Active immediately when we have a password to sign in with, pending otherwise.
     const initialStatus = status || (password ? "active" : "pending");
 
@@ -282,6 +348,12 @@ router.put("/team/:id", async (req, res, next) => {
     const m = await TeamMember.findOne({ _id: req.params.id, owner: req.user._id });
     if (!m) return res.status(404).json({ error: "Member not found" });
 
+    // Block changing a member's email to one that already belongs to a user.
+    if (typeof patch.email === "string" && patch.email.trim().toLowerCase() !== m.email) {
+      const clash = await User.findOne({ email: patch.email.trim().toLowerCase() });
+      if (clash) return res.status(409).json({ error: "That email already has a Leadnator user account — pick a different email." });
+    }
+
     Object.assign(m, patch);
     if (password) {
       if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
@@ -296,6 +368,66 @@ router.delete("/team/:id", async (req, res, next) => {
   try {
     const r = await TeamMember.deleteOne({ _id: req.params.id, owner: req.user._id });
     if (!r.deletedCount) return res.status(404).json({ error: "Member not found" });
+    res.json({ deleted: req.params.id });
+  } catch (err) { next(err); }
+});
+
+// ---------- LEAD ROUTING RULES (source/tag → team) ----------
+router.get("/assignment-rules", async (req, res, next) => {
+  try {
+    const rules = await AssignmentRule.find({ owner: req.user._id }).sort({ priority: 1, createdAt: 1 });
+    res.json({ rules: rules.map((r) => r.toJSON()) });
+  } catch (err) { next(err); }
+});
+
+router.post("/assignment-rules", async (req, res, next) => {
+  try {
+    const { matchSource = "", matchTag = "", team, priority = 0, enabled = true } = req.body || {};
+    if (!team || !/^[a-f0-9]{24}$/i.test(String(team))) return res.status(400).json({ error: "Pick a team for the rule" });
+    const t = await Team.findOne({ _id: team, owner: req.user._id });
+    if (!t) return res.status(404).json({ error: "Team not found" });
+    if (!String(matchSource).trim() && !String(matchTag).trim()) {
+      return res.status(400).json({ error: "Add a source or a tag to match on" });
+    }
+    const rule = await AssignmentRule.create({
+      owner: req.user._id,
+      organization: req.tenantId || null,
+      matchSource: String(matchSource).trim(),
+      matchTag: String(matchTag).trim(),
+      team: t._id,
+      priority: Number(priority) || 0,
+      enabled: !!enabled,
+    });
+    res.status(201).json({ rule: rule.toJSON() });
+  } catch (err) { next(err); }
+});
+
+router.put("/assignment-rules/:id", async (req, res, next) => {
+  try {
+    const { matchSource, matchTag, team, priority, enabled } = req.body || {};
+    const update = {};
+    if (typeof matchSource === "string") update.matchSource = matchSource.trim();
+    if (typeof matchTag === "string") update.matchTag = matchTag.trim();
+    if (typeof priority !== "undefined") update.priority = Number(priority) || 0;
+    if (typeof enabled === "boolean") update.enabled = enabled;
+    if (team) {
+      if (!/^[a-f0-9]{24}$/i.test(String(team))) return res.status(400).json({ error: "Invalid team" });
+      const t = await Team.findOne({ _id: team, owner: req.user._id });
+      if (!t) return res.status(404).json({ error: "Team not found" });
+      update.team = t._id;
+    }
+    const rule = await AssignmentRule.findOneAndUpdate(
+      { _id: req.params.id, owner: req.user._id }, update, { new: true, runValidators: true }
+    );
+    if (!rule) return res.status(404).json({ error: "Rule not found" });
+    res.json({ rule: rule.toJSON() });
+  } catch (err) { next(err); }
+});
+
+router.delete("/assignment-rules/:id", async (req, res, next) => {
+  try {
+    const r = await AssignmentRule.deleteOne({ _id: req.params.id, owner: req.user._id });
+    if (!r.deletedCount) return res.status(404).json({ error: "Rule not found" });
     res.json({ deleted: req.params.id });
   } catch (err) { next(err); }
 });

@@ -5,6 +5,9 @@ const schema = new mongoose.Schema(
     user:              { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
     organization:      { type: mongoose.Schema.Types.ObjectId, ref: "Organization", index: true },
     igAccountId:       { type: String, required: true },
+    // Instagram-Login returns a separate `user_id` (the value webhooks send as
+    // entry.id), which can differ from igAccountId. Stored so webhooks can match.
+    igUserId:          { type: String, default: "", index: true },
     username:          { type: String, default: "" },
     name:              { type: String, default: "" },
     profilePictureUrl: { type: String, default: "" },

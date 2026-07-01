@@ -279,8 +279,9 @@ async function processMessagingWebhook(entry, change, value) {
           const existing = await Lead.findOne({ owner: conn.user, phone: fromPhone });
           if (!existing) {
             const tags = Array.from(new Set(["whatsapp", ...(wa.defaultTags || [])]));
-            await Lead.create({
+            const waLead = await Lead.create({
               owner:  conn.user,
+              organization: conn.organization || undefined,
               name:   profileName || fromPhone,
               phone:  fromPhone,
               email:  "",
@@ -290,6 +291,7 @@ async function processMessagingWebhook(entry, change, value) {
               tags,
               notes:  text ? `First WhatsApp message: "${String(text).slice(0, 300)}"` : "Came in via WhatsApp",
             });
+            await require("../services/leadAssignment").autoAssignLead(waLead);
             log(`✓ created WhatsApp lead for ${fromPhone} (user ${conn.user})`);
           }
         }
@@ -315,6 +317,69 @@ async function processMessagingWebhook(entry, change, value) {
 }
 
 // ---------- POST: inbound events ----------
+// Handle WhatsApp Business Calling webhooks (field="calls"). We don't do any
+// WebRTC on the server — the browser (CallingClient) owns the media. We just
+// relay the call events + statuses to the owning user over Socket.IO so the
+// open inbox can ring, connect, or tear down. Terminated/failed calls are also
+// persisted as a "call_event" message so they show up in conversation history.
+async function processCallsWebhook(entry, change, value) {
+  const phoneNumberId = value?.metadata?.phone_number_id;
+  const wabaId = entry?.id;
+  const conn = await resolveWhatsAppConnection({ phoneNumberId, wabaId });
+  if (!conn) {
+    log(`⚠ calls webhook for phone=${phoneNumberId || "?"} waba=${wabaId || "?"} — no connection`);
+    remember({ kind: "ignored", reason: "no connection (calls)", phoneNumberId, wabaId });
+    return;
+  }
+
+  const contactName = value?.contacts?.[0]?.profile?.name || "";
+
+  // Call events: connect (offer/answer SDP), terminate, failed.
+  for (const call of value.calls || []) {
+    if (!call?.event) continue;
+    log(`call event: ${call.event} id=${call.id} from=${call.from} sdpType=${call.session?.sdp_type || "-"}`);
+    emitToUser(conn.user, "wa.call", {
+      kind: "event",
+      event: call.event,                     // connect | terminate | failed
+      callId: call.id,
+      from: call.from,
+      phoneNumberId: conn.phoneNumberId,
+      wabaId: conn.businessAccountId || wabaId,
+      contactName,
+      sdp: call.session?.sdp,
+      sdpType: call.session?.sdp_type,
+      duration: call.duration,
+    });
+
+    // Persist ended/failed calls into the conversation thread for history.
+    if ((call.event === "terminate" || call.event === "failed") && call.from) {
+      await WhatsAppMessage.create({
+        user: conn.user,
+        phoneNumberId: conn.phoneNumberId,
+        contactPhone: call.from,
+        direction: "inbound",
+        type: "call_event",
+        text: call.event === "failed" ? "Call failed" : "Call ended",
+        status: "received",
+        meta: { call: { event: call.event === "failed" ? "failed" : "ended", duration: call.duration || 0, callId: call.id } },
+      }).catch((e) => log("✗ save call_event failed:", e.message));
+    }
+  }
+
+  // Call statuses (mostly for outbound): ringing, accepted, rejected, completed, failed.
+  for (const st of value.statuses || []) {
+    if (!st?.status) continue;
+    log(`call status: id=${st.id} → ${st.status}`);
+    emitToUser(conn.user, "wa.call", {
+      kind: "status",
+      status: st.status,
+      callId: st.id,
+      phoneNumberId: conn.phoneNumberId,
+      wabaId: conn.businessAccountId || wabaId,
+    });
+  }
+}
+
 router.post("/", async (req, res) => {
   // Ack FAST — Meta retries aggressively if we take >10s or respond non-200.
   res.sendStatus(200);
@@ -345,6 +410,13 @@ router.post("/", async (req, res) => {
 
         if (field === "account_update") {
           await handleAccountUpdate(entry, change, value);
+          continue;
+        }
+
+        // Calling webhooks carry messaging_product="whatsapp" too, so this must
+        // be checked BEFORE the generic messaging branch.
+        if (field === "calls" || value.calls || (value.statuses && value.statuses[0]?.type === "call")) {
+          await processCallsWebhook(entry, change, value);
           continue;
         }
 

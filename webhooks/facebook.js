@@ -209,6 +209,7 @@ router.post("/", async (req, res) => {
             createdTime: created_time ? new Date(Number(created_time) * 1000) : new Date(),
           },
         });
+        await require("../services/leadAssignment").autoAssignLead(leadDoc);
         log(`✓ created lead ${leadDoc._id} for user ${user._id} (${name})`);
         remember({ kind: "lead", leadgen_id, page_id, name, email, phone });
 

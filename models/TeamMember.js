@@ -22,6 +22,15 @@ const schema = new mongoose.Schema(
     role:   { type: String, enum: ["Owner", "Admin", "Member", "Viewer"], default: "Member" },
     status: { type: String, enum: ["active", "pending", "suspended"], default: "pending" },
 
+    // Lead visibility scope (GHL-style). "all" = sees every lead in the
+    // workspace; "assigned" = sees only leads assigned to them.
+    leadAccess: { type: String, enum: ["all", "assigned"], default: "all" },
+
+    // Per-member table preferences — each member picks their own Leads-table
+    // columns / pipeline card fields independently of the owner.
+    leadColumns:    { type: [String], default: [] },
+    leadCardFields: { type: [String], default: [] },
+
     // Per-module permissions — see schema docblock above.
     permissions: { type: permissionSchema, default: {} },
   },
@@ -78,6 +87,7 @@ schema.methods.toSafeJSON = function () {
     status:       this.status,
     isTeamMember: true,
     memberRole:   this.role,
+    leadAccess:   this.leadAccess || "all",
     permissions:  this.permissions || {},
     team:         this.team ? this.team.toString() : null,
     ownerId:      this.owner ? this.owner.toString() : null,

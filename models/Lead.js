@@ -13,6 +13,16 @@ const leadSchema = new mongoose.Schema(
     notes:  { type: String, default: "" },
     value:  { type: Number, default: 0 },
 
+    // Lead assignment (GHL-style). `assignedTo` is the TeamMember who owns
+    // this lead; `assignedTeam` is that member's team (denormalised so the
+    // table can show the team badge and routing rules can filter by team).
+    assignedTo:   { type: mongoose.Schema.Types.ObjectId, ref: "TeamMember", default: null, index: true },
+    assignedTeam: { type: mongoose.Schema.Types.ObjectId, ref: "Team", default: null },
+    assignedAt:   { type: Date, default: null },
+    // The team member who created this lead (null = created by the owner or an
+    // automated source). Lets the owner see who added a lead.
+    createdBy:    { type: mongoose.Schema.Types.ObjectId, ref: "TeamMember", default: null },
+
     // Provenance for leads coming from Meta Lead Ads webhook — lets us dedupe
     // on retry and link back to the originating ad.
     metaLead: {
@@ -37,6 +47,29 @@ const leadSchema = new mongoose.Schema(
         ret.ownerId = ret.owner?.toString();
         delete ret._id;
         delete ret.owner;
+
+        // Expose assignment as flat ids + friendly objects. Only build the
+        // friendly {name,...} objects when the ref is actually POPULATED — a
+        // populated ref is a plain subdoc, a non-populated one is a raw
+        // ObjectId. (Note: a bson ObjectId's `_id` getter returns itself, so
+        // never sniff `_id` to detect population — use `instanceof` instead.)
+        const isId = (v) => v instanceof mongoose.Types.ObjectId;
+        const at = ret.assignedTo;
+        if (at && typeof at === "object" && !isId(at)) {
+          const id = (at._id || at.id)?.toString() || null;
+          ret.assignee = { id, name: at.name || "" };
+          ret.assignedTo = id;
+        } else {
+          ret.assignedTo = at ? at.toString() : null;
+        }
+        const tm = ret.assignedTeam;
+        if (tm && typeof tm === "object" && !isId(tm)) {
+          const id = (tm._id || tm.id)?.toString() || null;
+          ret.assigneeTeam = { id, name: tm.name || "", color: tm.color || "#7c3aed" };
+          ret.assignedTeam = id;
+        } else {
+          ret.assignedTeam = tm ? tm.toString() : null;
+        }
         return ret;
       },
     },

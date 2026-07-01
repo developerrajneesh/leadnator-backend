@@ -45,14 +45,34 @@ async function main() {
   await connectDB();
 
   const conns = await InstagramConnection.find()
-    .select("+pageAccessToken username igAccountId pageId authMethod user organization")
-    .lean();
+    .select("+pageAccessToken username igAccountId igUserId pageId authMethod user organization");
 
-  const summary = { total: conns.length, subscribed: 0, failed: 0, skipped: 0, results: [] };
+  const summary = { total: conns.length, subscribed: 0, failed: 0, skipped: 0, backfilled: 0, results: [] };
   console.log(`Found ${conns.length} Instagram connection(s).`);
 
   for (const conn of conns) {
     const label = `@${conn.username || conn.igAccountId} (${onIgHost(conn) ? "ig-login" : "fb-page"})`;
+
+    // Backfill igUserId (the value Instagram webhooks send as entry.id) so events
+    // can be matched to this connection.
+    if (onIgHost(conn) && conn.pageAccessToken) {
+      try {
+        const me = await axios.get(`${IG_GRAPH_BASE}/me`, {
+          params: { fields: "user_id,username", access_token: conn.pageAccessToken },
+          validateStatus: () => true,
+        });
+        const uid = me.data?.user_id ? String(me.data.user_id) : "";
+        if (uid && uid !== conn.igUserId) {
+          conn.igUserId = uid;
+          await conn.save();
+          summary.backfilled += 1;
+          console.log(`🔗 ${label} — igUserId set to ${uid}`);
+        }
+      } catch (e) {
+        console.warn(`   ${label} — igUserId backfill failed: ${e.message}`);
+      }
+    }
+
     try {
       const r = await subscribeOne(conn);
       if (r.ok) {
@@ -74,7 +94,7 @@ async function main() {
     await new Promise((r) => setTimeout(r, 300)); // gentle pacing
   }
 
-  console.log("\nSummary:", JSON.stringify({ total: summary.total, subscribed: summary.subscribed, failed: summary.failed, skipped: summary.skipped }, null, 2));
+  console.log("\nSummary:", JSON.stringify({ total: summary.total, subscribed: summary.subscribed, backfilled: summary.backfilled, failed: summary.failed, skipped: summary.skipped }, null, 2));
   process.exit(summary.failed > 0 ? 1 : 0);
 }
 

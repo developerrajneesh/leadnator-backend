@@ -1131,6 +1131,7 @@ router.post("/lead-forms/:formId/test-lead", async (req, res, next) => {
         createdTime:  new Date(),
       },
     }).catch((e) => { console.warn("[meta test-lead] local Lead insert failed:", e.message); return null; });
+    if (localLead) await require("./services/leadAssignment").autoAssignLead(localLead);
 
     // Fire the user's new_lead automations — same as a real webhook would.
     if (localLead) {
